@@ -19,8 +19,14 @@ Production-модуль обогащения объявления данными
     Даты здесь в формате DD/MM/YYYY HH:MM.
 
 Значения возвращаются как в HTML (только с нормализацией пробелов), пустое
-или отсутствующее поле даёт None. Даты detail-страницы не приводятся к
-формату list-страницы — это отдельный шаг сравнения.
+или отсутствующее поле даёт None. Исключение — даты detail-страницы
+(published_at_detail, deadline_at_detail): они приводятся к формату
+list-страницы YYYY-MM-DD HH:MM:SS, нераспознанный формат даёт None.
+
+Исходные published_at / deadline_at объявления не изменяются. Их
+согласованность с датами detail-страницы отдаётся в поле consistency
+(True / False / None, если сравнить нечего). Расхождение не исправляется
+автоматически. Имена файлов документов с procedure_code не сопоставляются.
 
 Ошибки сети (requests.RequestException, HTTP-статусы) наружу не скрываются:
 их обрабатывает вызывающий код.
@@ -30,6 +36,7 @@ import json
 import logging
 import re
 import sys
+from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -90,10 +97,27 @@ ARMEPS_REQUIRED = (
 DOWNLOAD_ONCLICK = re.compile(r"downloadDocForAnonymous\(\s*(\d+)\s*\)")
 CPV_LINE = re.compile(r"^(\d{8})\s*-\s*(.*)$")
 
-# Диагностические примеры для main (реальные страницы, проверенные ранее)
-DIAGNOSTIC_URLS = (
-    "https://eauction.armeps.am/hy/public/tender_details/tmid/d903e27c-3159-45ae-be43-6f33a82068ba",
-    "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12486627",
+DETAIL_DATETIME_INPUT_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",  # eAuction
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M",  # ARMEPS
+)
+DETAIL_DATETIME_OUTPUT_FORMAT = "%Y-%m-%d %H:%M:%S"  # формат list-страницы Gnumner
+DETAIL_DATE_FIELDS = ("published_at_detail", "deadline_at_detail")
+
+# Диагностические примеры для main: реальные страницы и даты их объявлений
+# на list-странице Gnumner (получены при live-проверке, 2026-09-25).
+DIAGNOSTIC_ANNOUNCEMENTS = (
+    {
+        "resource_url": "https://eauction.armeps.am/hy/public/tender_details/tmid/d903e27c-3159-45ae-be43-6f33a82068ba",
+        "published_at": "2026-09-25 16:53:27",
+        "deadline_at": "2026-10-06 09:00:00",
+    },
+    {
+        "resource_url": "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12486627",
+        "published_at": "2026-09-25 17:48:00",
+        "deadline_at": "2026-10-05 14:30:00",
+    },
 )
 
 
@@ -139,6 +163,59 @@ def _parse_int(text: str | None) -> int | None:
     return int(text) if text and text.isdigit() else None
 
 
+def normalize_detail_datetime(value: str | None) -> str | None:
+    """
+    Дата detail-страницы -> 'YYYY-MM-DD HH:MM:SS'.
+
+    Формат распознаётся только из DETAIL_DATETIME_INPUT_FORMATS. Пустое
+    значение даёт None; неизвестный формат тоже None (дата не угадывается)
+    с предупреждением в логе.
+    """
+    if value is None:
+        return None
+
+    text = " ".join(value.split())
+    if not text:
+        return None
+
+    for input_format in DETAIL_DATETIME_INPUT_FORMATS:
+        try:
+            parsed = datetime.strptime(text, input_format)
+        except ValueError:
+            continue
+        return parsed.strftime(DETAIL_DATETIME_OUTPUT_FORMAT)
+
+    logger.warning("Формат даты detail-страницы не распознан, значение None: %r", text)
+    return None
+
+
+def _normalize_date_fields(fields: dict) -> None:
+    for name in DETAIL_DATE_FIELDS:
+        fields[name] = normalize_detail_datetime(fields[name])
+
+
+def _dates_match(list_value: str | None, detail_value: str | None) -> bool | None:
+    if not list_value or not detail_value:
+        return None
+    return list_value == detail_value
+
+
+def compare_announcement_with_detail(announcement: dict, enrichment: dict) -> dict:
+    """
+    Сравнивает даты list-страницы (announcement) с нормализованными датами
+    detail-страницы (enrichment). True/False — обе даты есть и равны/различаются;
+    None — одной из сторон нет, сравнение невозможно (это не расхождение).
+    """
+    return {
+        "published_at_match": _dates_match(
+            announcement.get("published_at"), enrichment.get("published_at_detail"),
+        ),
+        "deadline_at_match": _dates_match(
+            announcement.get("deadline_at"), enrichment.get("deadline_at_detail"),
+        ),
+    }
+
+
 # --------------------------------------------------------------------------
 # eAuction
 # --------------------------------------------------------------------------
@@ -162,6 +239,7 @@ def parse_eauction_detail(html: str) -> dict:
             result["document_url"] = link["href"].strip()
             break
 
+    _normalize_date_fields(result)
     return result
 
 
@@ -197,6 +275,7 @@ def parse_armeps_detail(html: str) -> dict:
         else:
             result[field] = _element_text(dd)
 
+    _normalize_date_fields(result)
     return result
 
 
@@ -272,6 +351,16 @@ def _status_for(fields: dict, required: tuple[str, ...]) -> str:
     return STATUS_SUCCESS
 
 
+def _checked_consistency(announcement: dict, fields: dict) -> dict:
+    consistency = compare_announcement_with_detail(announcement, fields)
+    for name, match in consistency.items():
+        if match is False:
+            logger.warning(
+                "Расхождение с list-страницей: %s (%s)", name, announcement.get("resource_url"),
+            )
+    return consistency
+
+
 def enrich_announcement(announcement: dict) -> dict:
     """
     Новый dict: копия announcement + enrichment_status + данные detail-страницы.
@@ -284,6 +373,7 @@ def enrich_announcement(announcement: dict) -> dict:
     if resource_type == RESOURCE_EAUCTION_TENDER_PAGE:
         fields = parse_eauction_detail(fetch_eauction_page(resource_url))
         enriched.update(fields)
+        enriched["consistency"] = _checked_consistency(announcement, fields)
         enriched["enrichment_status"] = _status_for(fields, EAUCTION_REQUIRED)
 
     elif resource_type == RESOURCE_ARMEPS_DOCUMENTS_PAGE:
@@ -293,6 +383,7 @@ def enrich_announcement(announcement: dict) -> dict:
         enriched.update(fields)
         enriched["resource_id"] = extract_resource_id(resource_url)
         enriched["documents"] = documents
+        enriched["consistency"] = _checked_consistency(announcement, fields)
         enriched["enrichment_status"] = _status_for(
             {**fields, "documents": documents}, ARMEPS_REQUIRED + ("documents",)
         )
@@ -323,8 +414,9 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    for url in DIAGNOSTIC_URLS:
-        announcement = {"resource_url": url, "resource_type": classify_resource_url(url)}
+    for diagnostic in DIAGNOSTIC_ANNOUNCEMENTS:
+        url = diagnostic["resource_url"]
+        announcement = {**diagnostic, "resource_type": classify_resource_url(url)}
         print("=" * 78)
         print(f"{announcement['resource_type']}: {url}")
 

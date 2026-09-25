@@ -127,20 +127,107 @@ EAUCTION_URL = "https://eauction.armeps.am/hy/public/tender_details/tmid/d903e27
 ARMEPS_URL = "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12486627"
 
 
-def make_announcement(resource_type: str, resource_url: str) -> dict:
-    return {
+def make_announcement(resource_type: str, resource_url: str, **overrides) -> dict:
+    announcement = {
         "title": "Тестовое объявление",
         "resource_type": resource_type,
         "resource_url": resource_url,
         "published_at": "2026-09-25 18:59:34",
         "deadline_at": "2026-10-02 11:10:00",
     }
+    announcement.update(overrides)
+    return announcement
 
 
 def make_response(html: str) -> mock.Mock:
     response = mock.Mock()
     response.text = html
     return response
+
+
+class NormalizeDetailDatetimeTest(unittest.TestCase):
+    def test_iso_datetime_is_unchanged(self):
+        self.assertEqual(
+            enrichment.normalize_detail_datetime("2026-10-06 09:00:00"), "2026-10-06 09:00:00",
+        )
+
+    def test_day_first_without_seconds(self):
+        self.assertEqual(
+            enrichment.normalize_detail_datetime("05/10/2026 14:30"), "2026-10-05 14:30:00",
+        )
+
+    def test_day_first_with_seconds(self):
+        self.assertEqual(
+            enrichment.normalize_detail_datetime("25/09/2026 18:49:07"), "2026-09-25 18:49:07",
+        )
+
+    def test_surrounding_whitespace_is_ignored(self):
+        self.assertEqual(
+            enrichment.normalize_detail_datetime("\n  05/10/2026 14:30 \n"), "2026-10-05 14:30:00",
+        )
+
+    def test_none_and_empty_give_none(self):
+        self.assertIsNone(enrichment.normalize_detail_datetime(None))
+        self.assertIsNone(enrichment.normalize_detail_datetime(""))
+        self.assertIsNone(enrichment.normalize_detail_datetime("   "))
+
+    def test_unknown_format_gives_none_and_warning(self):
+        with self.assertLogs(enrichment.logger, level="WARNING"):
+            result = enrichment.normalize_detail_datetime("October 5, 2026 14:30")
+
+        self.assertIsNone(result)
+
+    def test_impossible_date_gives_none(self):
+        with self.assertLogs(enrichment.logger, level="WARNING"):
+            result = enrichment.normalize_detail_datetime("31/02/2026 10:00")
+
+        self.assertIsNone(result)
+
+
+class CompareAnnouncementWithDetailTest(unittest.TestCase):
+    def test_same_published_at_is_true(self):
+        result = enrichment.compare_announcement_with_detail(
+            {"published_at": "2026-09-25 16:53:27"},
+            {"published_at_detail": "2026-09-25 16:53:27"},
+        )
+
+        self.assertIs(result["published_at_match"], True)
+
+    def test_different_published_at_is_false(self):
+        result = enrichment.compare_announcement_with_detail(
+            {"published_at": "2026-09-25 17:48:00"},
+            {"published_at_detail": "2026-09-25 18:49:00"},
+        )
+
+        self.assertIs(result["published_at_match"], False)
+
+    def test_same_deadline_after_normalization_is_true(self):
+        detail = enrichment.parse_armeps_detail(ARMEPS_HTML)
+
+        result = enrichment.compare_announcement_with_detail(
+            {"deadline_at": "2026-10-05 14:30:00"}, detail,
+        )
+
+        self.assertIs(result["deadline_at_match"], True)
+
+    def test_missing_detail_deadline_is_none(self):
+        result = enrichment.compare_announcement_with_detail(
+            {"deadline_at": "2026-10-05 14:30:00"}, {"deadline_at_detail": None},
+        )
+
+        self.assertIsNone(result["deadline_at_match"])
+
+    def test_missing_list_deadline_is_none(self):
+        result = enrichment.compare_announcement_with_detail(
+            {"deadline_at": None}, {"deadline_at_detail": "2026-10-05 14:30:00"},
+        )
+
+        self.assertIsNone(result["deadline_at_match"])
+
+    def test_missing_keys_are_none_not_mismatch(self):
+        result = enrichment.compare_announcement_with_detail({}, {})
+
+        self.assertEqual(result, {"published_at_match": None, "deadline_at_match": None})
 
 
 class ParseEauctionDetailTest(unittest.TestCase):
@@ -202,8 +289,9 @@ class ParseArmepsDetailTest(unittest.TestCase):
         )
 
     def test_deadline_and_published(self):
-        self.assertEqual(self.result["deadline_at_detail"], "05/10/2026 14:30")
-        self.assertEqual(self.result["published_at_detail"], "25/09/2026 18:49")
+        # DD/MM/YYYY HH:MM в HTML -> YYYY-MM-DD HH:MM:SS
+        self.assertEqual(self.result["deadline_at_detail"], "2026-10-05 14:30:00")
+        self.assertEqual(self.result["published_at_detail"], "2026-09-25 18:49:00")
 
     def test_titles_do_not_mix_languages(self):
         self.assertEqual(self.result["detail_title"], "ՀՀ Արմավիրի մարզի Արաքս համայնք")
@@ -329,6 +417,45 @@ class EnrichAnnouncementTest(unittest.TestCase):
         # исходные даты list-страницы не перезаписываются
         self.assertEqual(result["deadline_at"], "2026-10-02 11:10:00")
         self.assertEqual(result["deadline_at_detail"], "2026-10-06 09:00:00")
+
+    def test_eauction_live_like_dates_match(self):
+        self.get.return_value = make_response(EAUCTION_HTML)
+        announcement = make_announcement(
+            "eauction_tender_page", EAUCTION_URL,
+            published_at="2026-09-25 16:53:27", deadline_at="2026-10-06 09:00:00",
+        )
+
+        result = enrichment.enrich_announcement(announcement)
+
+        self.assertEqual(
+            result["consistency"], {"published_at_match": True, "deadline_at_match": True},
+        )
+
+    def test_armeps_live_like_published_differs_deadline_matches(self):
+        self.session.get.return_value = make_response(ARMEPS_PAGE_HTML)
+        announcement = make_announcement(
+            "armeps_documents_page", ARMEPS_URL,
+            published_at="2026-09-25 17:48:00", deadline_at="2026-10-05 14:30:00",
+        )
+
+        result = enrichment.enrich_announcement(announcement)
+
+        self.assertEqual(result["published_at_detail"], "2026-09-25 18:49:00")
+        self.assertEqual(result["deadline_at_detail"], "2026-10-05 14:30:00")
+        self.assertEqual(
+            result["consistency"], {"published_at_match": False, "deadline_at_match": True},
+        )
+        # исходные даты и код процедуры не «исправляются»
+        self.assertEqual(result["published_at"], "2026-09-25 17:48:00")
+        self.assertEqual(result["procedure_code"], "ԱՄԱՀ-ԱՊ-ԳՀԱՊՁԲ-26/107")
+
+    def test_direct_file_and_unknown_have_no_consistency(self):
+        for resource_type in ("direct_file", "unknown"):
+            result = enrichment.enrich_announcement(
+                make_announcement(resource_type, "https://example.test/x")
+            )
+
+            self.assertNotIn("consistency", result)
 
     def test_eauction_missing_fields_give_partial(self):
         self.get.return_value = make_response('<div class="de_t">Ծածկագիր</div><div class="de_v">X-1</div>')
