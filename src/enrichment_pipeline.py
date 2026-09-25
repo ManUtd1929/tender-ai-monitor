@@ -29,6 +29,10 @@ def process_announcement(announcement: dict, db_path=None) -> dict:
     storage_status = enrichment_repository.save_enrichment(
         resource_url, enrichment, db_path=db_path
     )
+    # Успех очищает ошибку предыдущей неудачной попытки (refresh обновлённого объявления).
+    enrichment_repository.save_enrichment_processing_state(
+        resource_url, enrichment_repository.PROCESSING_SUCCESS, db_path=db_path
+    )
     logger.info(
         "Объявление обработано: %s, enrichment_status=%s, storage_status=%s",
         resource_url, enrichment.get("enrichment_status"), storage_status,
@@ -42,8 +46,31 @@ def process_announcement(announcement: dict, db_path=None) -> dict:
     }
 
 
+def _save_failed_state(resource_url, error: Exception, db_path=None) -> None:
+    """
+    Сохраняет state = failed, чтобы объявление попало в retry, даже если у него остался
+    старый валидный enrichment. Сбой самого сохранения только логируется: исходная ошибка
+    enrichment всё равно остаётся в failures.
+    """
+    if not resource_url:
+        return
+    try:
+        enrichment_repository.save_enrichment_processing_state(
+            resource_url,
+            enrichment_repository.PROCESSING_FAILED,
+            error_type=type(error).__name__,
+            error_message=str(error),
+            db_path=db_path,
+        )
+    except Exception:
+        logger.exception("Не удалось сохранить состояние enrichment failed: %s", resource_url)
+
+
 def process_announcements(announcements: list[dict], db_path=None) -> dict:
-    """Последовательно обрабатывает объявления; ошибки отдельных объявлений собираются в failures."""
+    """
+    Последовательно обрабатывает объявления; ошибки отдельных объявлений собираются в failures
+    и сохраняются как enrichment_processing_state = failed (init_db выше состояний не создаёт).
+    """
     logger.info("Запуск обогащения: объявлений %d", len(announcements))
 
     enrichment_repository.init_db(db_path=db_path)
@@ -58,6 +85,7 @@ def process_announcements(announcements: list[dict], db_path=None) -> dict:
         except Exception as error:
             resource_url = announcement.get("resource_url") if isinstance(announcement, dict) else None
             logger.exception("Не удалось обработать объявление: %s", resource_url)
+            _save_failed_state(resource_url, error, db_path=db_path)
             failures.append({
                 "resource_url": resource_url,
                 "error_type": type(error).__name__,

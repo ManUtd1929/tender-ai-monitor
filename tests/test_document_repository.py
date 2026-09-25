@@ -10,10 +10,11 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from src.database import announcement_repository, document_repository as repo
+from src.database import announcement_repository, enrichment_repository, document_repository as repo
 
 RESOURCE_URL = "https://example.test/resource/1"
 SOURCE_KIND = "armeps_document"
@@ -483,6 +484,295 @@ class DocumentRepositoryTest(unittest.TestCase):
             conn.execute("DELETE FROM document_downloads WHERE id = ?", (download_id,))
 
         self.assertEqual(repo.count_extractions(self.db_path), 0)
+
+
+class ProcessingStateTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = Path(self._tmp.name) / "test.db"
+
+        enrichment_repository.init_db(self.db_path)
+        repo.init_db(self.db_path)
+
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+    def url(self, number) -> str:
+        return f"https://example.test/resource/{number}"
+
+    def add(self, number, enrich=True, first_seen_at=None) -> str:
+        """Объявление (+ enrichment по умолчанию); first_seen_at задаёт порядок «старости»."""
+        url = self.url(number)
+        announcement_repository.save_announcement(
+            make_announcement(resource_url=url, title=f"Объявление {number}"), self.db_path
+        )
+        if enrich:
+            enrichment_repository.save_enrichment(
+                url,
+                {
+                    "enrichment_status": "success",
+                    "cpv_codes": [{"code": "60100000", "name": "Road transport"}],
+                    "documents": [
+                        {"document_id": "1", "filename": "a.docx", "language": "RU",
+                         "title": None, "description": None},
+                    ],
+                },
+                self.db_path,
+            )
+        if first_seen_at is not None:
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
+                conn.execute(
+                    "UPDATE announcements SET first_seen_at = ? WHERE resource_url = ?",
+                    (first_seen_at, url),
+                )
+        return url
+
+    def save_state(self, number, status, **kwargs):
+        repo.save_processing_state(self.url(number), status, db_path=self.db_path, **kwargs)
+
+    def candidate_urls(self, **kwargs) -> list[str]:
+        candidates = repo.get_document_processing_candidates(self.db_path, **kwargs)
+        return [item["resource_url"] for item in candidates]
+
+    # --- схема / round-trip ---
+
+    def test_init_db_creates_processing_state_table(self):
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            names = {
+                row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+        self.assertIn("document_processing_state", names)
+
+    def test_init_db_keeps_existing_downloads_and_states(self):
+        url = self.add(1)
+        repo.save_download(
+            url, SOURCE_KIND, SOURCE_REF, make_download_result(), db_path=self.db_path
+        )
+        self.save_state(1, "success", source_kind=SOURCE_KIND, source_ref=SOURCE_REF)
+
+        repo.init_db(self.db_path)  # повторный init на «живой» БД
+
+        self.assertEqual(repo.count_downloads(self.db_path), 1)
+        self.assertEqual(repo.get_processing_state(url, self.db_path)["status"], "success")
+
+    def test_init_db_adds_state_table_to_legacy_db(self):
+        legacy_path = Path(self._tmp.name) / "legacy.db"
+        enrichment_repository.init_db(legacy_path)
+        with closing(sqlite3.connect(legacy_path)) as conn, conn:
+            conn.execute(repo.CREATE_DOWNLOADS_TABLE)
+            conn.execute(repo.CREATE_EXTRACTIONS_TABLE)
+
+        repo.init_db(legacy_path)
+
+        self.assertIsNone(repo.get_processing_state(self.url(1), legacy_path))
+
+    def test_success_state_round_trip(self):
+        url = self.add(1)
+        self.save_state(1, "success", source_kind="armeps_document", source_ref="12486745")
+
+        state = repo.get_processing_state(url, self.db_path)
+
+        self.assertEqual(state["resource_url"], url)
+        self.assertEqual(state["status"], "success")
+        self.assertEqual(state["source_kind"], "armeps_document")
+        self.assertEqual(state["source_ref"], "12486745")
+        self.assertIsNone(state["error_type"])
+        self.assertIsNone(state["error_message"])
+
+    def test_no_supported_document_state_round_trip(self):
+        url = self.add(1)
+        self.save_state(1, "no_supported_document")
+
+        state = repo.get_processing_state(url, self.db_path)
+
+        self.assertEqual(state["status"], "no_supported_document")
+        self.assertIsNone(state["source_kind"])
+        self.assertIsNone(state["source_ref"])
+
+    def test_failed_state_keeps_error(self):
+        url = self.add(1)
+        self.save_state(1, "failed", error_type="SSLError", error_message="handshake failed")
+
+        state = repo.get_processing_state(url, self.db_path)
+
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["error_type"], "SSLError")
+        self.assertEqual(state["error_message"], "handshake failed")
+
+    def test_last_attempt_at_is_timezone_aware_utc(self):
+        url = self.add(1)
+        self.save_state(1, "success")
+
+        moment = datetime.fromisoformat(repo.get_processing_state(url, self.db_path)["last_attempt_at"])
+
+        self.assertIsNotNone(moment.tzinfo)
+        self.assertEqual(moment.utcoffset(), timedelta(0))
+
+    def test_upsert_replaces_state_and_clears_error(self):
+        url = self.add(1)
+        self.save_state(1, "failed", error_type="E", error_message="m")
+        self.save_state(1, "success", source_kind=SOURCE_KIND, source_ref=SOURCE_REF)
+
+        state = repo.get_processing_state(url, self.db_path)
+
+        self.assertEqual(state["status"], "success")
+        self.assertEqual(state["source_ref"], SOURCE_REF)
+        self.assertIsNone(state["error_type"])
+        self.assertIsNone(state["error_message"])
+        self.assertEqual(self.count_states(), 1)
+
+    def test_get_state_missing_is_none(self):
+        self.assertIsNone(repo.get_processing_state(self.url(1), self.db_path))
+
+    def test_unknown_resource_url_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            repo.save_processing_state(self.url(99), "success", db_path=self.db_path)
+        self.assertEqual(self.count_states(), 0)
+
+    def test_blank_resource_url_or_status_raises(self):
+        self.add(1)
+        with self.assertRaises(ValueError):
+            repo.save_processing_state("", "success", db_path=self.db_path)
+        with self.assertRaises(ValueError):
+            repo.save_processing_state(self.url(1), " ", db_path=self.db_path)
+
+    def count_states(self) -> int:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            return conn.execute("SELECT COUNT(*) FROM document_processing_state").fetchone()[0]
+
+    # --- кандидаты ---
+
+    def test_candidates_include_missing_state(self):
+        url = self.add(1)
+        self.assertEqual(self.candidate_urls(), [url])
+
+    def test_candidates_include_failed(self):
+        url = self.add(1)
+        self.save_state(1, "failed", error_type="E", error_message="m")
+        self.assertEqual(self.candidate_urls(), [url])
+
+    def test_candidates_exclude_success(self):
+        self.add(1)
+        self.save_state(1, "success")
+        self.assertEqual(self.candidate_urls(), [])
+
+    def test_candidates_exclude_no_supported_document(self):
+        self.add(1)
+        self.save_state(1, "no_supported_document")
+        self.assertEqual(self.candidate_urls(), [])
+
+    def test_candidates_exclude_announcement_without_enrichment(self):
+        self.add(1, enrich=False)
+        self.assertEqual(self.candidate_urls(), [])
+
+    def test_candidates_are_ordered_oldest_first(self):
+        self.add(1, first_seen_at="2026-09-03T00:00:00+00:00")
+        self.add(2, first_seen_at="2026-09-01T00:00:00+00:00")
+        self.add(3, first_seen_at="2026-09-02T00:00:00+00:00")
+
+        self.assertEqual(self.candidate_urls(), [self.url(2), self.url(3), self.url(1)])
+
+    def test_candidates_same_first_seen_at_ordered_by_id(self):
+        for number in (1, 2, 3):
+            self.add(number, first_seen_at="2026-09-01T00:00:00+00:00")
+
+        self.assertEqual(self.candidate_urls(), [self.url(1), self.url(2), self.url(3)])
+
+    def test_candidates_limit(self):
+        for number in (1, 2, 3, 4):
+            self.add(number, first_seen_at=f"2026-09-0{number}T00:00:00+00:00")
+
+        self.assertEqual(self.candidate_urls(limit=2), [self.url(1), self.url(2)])
+        self.assertEqual(len(self.candidate_urls(limit=None)), 4)
+        self.assertEqual(len(self.candidate_urls()), 4)
+
+    def test_candidates_limit_applies_after_filtering(self):
+        self.add(1, first_seen_at="2026-09-01T00:00:00+00:00")
+        self.add(2, first_seen_at="2026-09-02T00:00:00+00:00")
+        self.save_state(1, "success")
+
+        self.assertEqual(self.candidate_urls(limit=1), [self.url(2)])
+
+    def test_never_attempted_go_before_failed_even_if_newer(self):
+        failed_old = self.add(1, first_seen_at="2026-09-01T00:00:00+00:00")
+        self.save_state(1, "failed", error_type="E", error_message="m")
+        new_late = self.add(2, first_seen_at="2026-09-05T00:00:00+00:00")
+        new_early = self.add(3, first_seen_at="2026-09-04T00:00:00+00:00")
+
+        self.assertEqual(self.candidate_urls(), [new_early, new_late, failed_old])
+
+    def test_order_inside_groups_is_first_seen_at_then_id(self):
+        failed_b = self.add(1, first_seen_at="2026-09-02T00:00:00+00:00")
+        failed_a = self.add(2, first_seen_at="2026-09-01T00:00:00+00:00")
+        never_a = self.add(3, first_seen_at="2026-09-03T00:00:00+00:00")
+        never_b = self.add(4, first_seen_at="2026-09-03T00:00:00+00:00")
+        for number in (1, 2):
+            self.save_state(number, "failed", error_type="E", error_message="m")
+
+        self.assertEqual(self.candidate_urls(), [never_a, never_b, failed_a, failed_b])
+
+    def test_failed_documents_do_not_starve_never_attempted_with_limit(self):
+        failed = []
+        for number in (1, 2, 3):
+            failed.append(self.add(number, first_seen_at=f"2026-08-0{number}T00:00:00+00:00"))
+            self.save_state(number, "failed", error_type="E", error_message="m")
+        never = [
+            self.add(number, first_seen_at=f"2026-09-0{number - 3}T00:00:00+00:00")
+            for number in (4, 5, 6)
+        ]
+
+        self.assertEqual(self.candidate_urls(limit=3), never)
+        self.assertEqual(self.candidate_urls(limit=4), never + failed[:1])
+        self.assertEqual(self.candidate_urls(), never + failed)
+
+    def test_candidates_exclude_failed_enrichment_refresh(self):
+        # Обновлённое объявление: enrichment устарел, документы — только после успешного refresh.
+        stale = self.add(1)
+        fresh = self.add(2)
+        enrichment_repository.save_enrichment_processing_state(
+            stale, "failed", error_type="E", error_message="m", db_path=self.db_path
+        )
+        enrichment_repository.save_enrichment_processing_state(
+            fresh, "success", db_path=self.db_path
+        )
+
+        self.assertEqual(self.candidate_urls(), [fresh])
+        self.assertEqual(repo.count_document_processing_candidates(self.db_path), 1)
+
+        enrichment_repository.save_enrichment_processing_state(
+            stale, "success", db_path=self.db_path
+        )
+
+        self.assertEqual(self.candidate_urls(), [stale, fresh])
+
+    def test_invalid_limit_raises(self):
+        for limit in (0, -1, True, 1.5):
+            with self.subTest(limit=limit):
+                with self.assertRaises(ValueError):
+                    repo.get_document_processing_candidates(self.db_path, limit=limit)
+
+    def test_candidate_is_ready_for_document_pipeline(self):
+        self.add(1)
+
+        candidate = repo.get_document_processing_candidates(self.db_path)[0]
+
+        self.assertEqual(candidate["resource_type"], "armeps_documents_page")
+        self.assertEqual(candidate["cpv_codes"], [{"code": "60100000", "name": "Road transport"}])
+        self.assertEqual(candidate["documents"][0]["document_id"], "1")
+        self.assertEqual(
+            candidate, enrichment_repository.get_announcement_with_enrichment(self.url(1), self.db_path)
+        )
+
+    def test_count_candidates_matches_query_without_limit(self):
+        for number in (1, 2, 3, 4):
+            self.add(number)
+        self.save_state(1, "success")
+        self.save_state(2, "failed", error_type="E", error_message="m")
+        self.save_state(3, "no_supported_document")
+
+        self.assertEqual(repo.count_document_processing_candidates(self.db_path), 2)
+        self.assertEqual(len(self.candidate_urls()), 2)
 
 
 if __name__ == "__main__":

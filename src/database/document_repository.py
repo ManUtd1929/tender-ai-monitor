@@ -11,8 +11,14 @@ document_extractions — результат извлечения текста: �
 (download_id, member_name). Для обычного DOCX member_name = "", для ZIP — имя member.
 Статусы: success, failed, skipped (SQL CHECK намеренно нет).
 
+document_processing_state — итог обработки документов объявления (по одной строке на
+resource_url): success, no_supported_document или failed (SQL CHECK намеренно нет). По ней
+get_document_processing_candidates решает, какие объявления ещё нужно обработать.
+
 Таблица announcements здесь только читается (проверка resource_url); её схема
-и данные не изменяются. Общий у модулей только файл БД.
+и данные не изменяются. Общий у модулей только файл БД. Запросы кандидатов читают также
+announcement_enrichment и enrichment_processing_state, поэтому перед ними должен быть
+вызван enrichment_repository.init_db.
 """
 
 import logging
@@ -21,7 +27,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.database import announcement_repository
+from src.database import announcement_repository, enrichment_repository
 from src.database.tender_repository import DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
@@ -33,6 +39,10 @@ STATUS_EXISTING = announcement_repository.STATUS_EXISTING
 EXTRACTION_SUCCESS = "success"
 EXTRACTION_FAILED = "failed"
 EXTRACTION_SKIPPED = "skipped"
+
+PROCESSING_SUCCESS = "success"
+PROCESSING_NO_SUPPORTED_DOCUMENT = "no_supported_document"
+PROCESSING_FAILED = "failed"
 
 # Поля download_result из document_downloader; size_bytes проверяется отдельно (0 допустим).
 REQUIRED_DOWNLOAD_RESULT_FIELDS = ("source_url", "saved_path", "filename", "sha256")
@@ -87,6 +97,59 @@ CREATE TABLE IF NOT EXISTS document_extractions (
 )
 """
 
+CREATE_PROCESSING_STATE_TABLE = """
+CREATE TABLE IF NOT EXISTS document_processing_state (
+    resource_url    TEXT PRIMARY KEY,
+    status          TEXT NOT NULL,
+    source_kind     TEXT,
+    source_ref      TEXT,
+    last_attempt_at TEXT NOT NULL,
+    error_type      TEXT,
+    error_message   TEXT,
+    FOREIGN KEY (resource_url) REFERENCES announcements (resource_url)
+)
+"""
+
+UPSERT_PROCESSING_STATE = """
+INSERT INTO document_processing_state (
+    resource_url, status, source_kind, source_ref, last_attempt_at, error_type, error_message
+) VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (resource_url) DO UPDATE SET
+    status = excluded.status,
+    source_kind = excluded.source_kind,
+    source_ref = excluded.source_ref,
+    last_attempt_at = excluded.last_attempt_at,
+    error_type = excluded.error_type,
+    error_message = excluded.error_message
+"""
+
+# Кандидаты: enrichment уже есть, а состояния обработки нет или оно failed.
+# Объявления с failed refresh enrichment исключаются: их enrichment устарел, документы
+# нужно обрабатывать только после успешного повторного enrichment.
+FROM_PROCESSING_CANDIDATES = """
+FROM announcements
+JOIN announcement_enrichment
+    ON announcement_enrichment.resource_url = announcements.resource_url
+LEFT JOIN document_processing_state
+    ON document_processing_state.resource_url = announcements.resource_url
+LEFT JOIN enrichment_processing_state
+    ON enrichment_processing_state.resource_url = announcements.resource_url
+WHERE (document_processing_state.resource_url IS NULL
+        OR document_processing_state.status = 'failed')
+    AND (enrichment_processing_state.status IS NULL
+        OR enrichment_processing_state.status != 'failed')
+"""
+
+# Сначала ни разу не обработанные, затем failed: постоянно падающие документы
+# не должны блокировать новые (limit берёт из начала списка).
+SELECT_PROCESSING_CANDIDATE_URLS = (
+    f"SELECT announcements.resource_url {FROM_PROCESSING_CANDIDATES} "
+    "ORDER BY CASE WHEN document_processing_state.resource_url IS NULL THEN 0 ELSE 1 END ASC, "
+    "announcements.first_seen_at ASC, announcements.id ASC"
+)
+
+COUNT_PROCESSING_CANDIDATES = f"SELECT COUNT(*) {FROM_PROCESSING_CANDIDATES}"
+
 SELECT_EXISTING_DOWNLOAD = """
 SELECT id FROM document_downloads
 WHERE resource_url = ? AND source_kind = ? AND source_ref = ? AND sha256 = ?
@@ -137,12 +200,13 @@ def _connect(db_path=None):
 
 
 def init_db(db_path=None) -> Path:
-    """Создаёт announcements (если нет) и таблицы документов. Данные не изменяет."""
+    """Создаёт announcements (если нет) и таблицы документов и состояния. Данные не изменяет."""
     path = announcement_repository.init_db(db_path)
 
     with _connect(path) as conn:
         conn.execute(CREATE_DOWNLOADS_TABLE)
         conn.execute(CREATE_EXTRACTIONS_TABLE)
+        conn.execute(CREATE_PROCESSING_STATE_TABLE)
 
     logger.info("Таблицы документов готовы: %s", path)
     return path
@@ -360,6 +424,88 @@ def save_zip_extraction(download_id: int, extraction_result: dict, db_path=None)
         counts["existing_count"],
     )
     return counts
+
+
+# --- состояние обработки ---
+
+def save_processing_state(
+    resource_url: str,
+    status: str,
+    source_kind: str | None = None,
+    source_ref: str | None = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    db_path=None,
+) -> None:
+    """
+    Upsert по resource_url; last_attempt_at — текущее UTC-время (timezone-aware).
+    Все поля строки перезаписываются: успешная попытка очищает прежнюю ошибку.
+    ValueError — пустой resource_url/status или нет объявления в announcements.
+    """
+    if _is_blank(resource_url):
+        raise ValueError("resource_url не может быть пустым")
+    if _is_blank(status):
+        raise ValueError(f"У состояния обработки отсутствует status: {resource_url}")
+
+    with _connect(db_path) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM announcements WHERE resource_url = ?", (resource_url,)
+        ).fetchone()
+        if exists is None:
+            raise ValueError(f"Объявление не найдено в announcements: {resource_url}")
+
+        conn.execute(
+            UPSERT_PROCESSING_STATE,
+            (resource_url, status, source_kind, source_ref, _utc_now(), error_type, error_message),
+        )
+
+    logger.info("Состояние обработки документов сохранено (%s): %s", status, resource_url)
+
+
+def get_processing_state(resource_url: str, db_path=None) -> dict | None:
+    with _connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM document_processing_state WHERE resource_url = ?", (resource_url,)
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_document_processing_candidates(db_path=None, limit: int | None = None) -> list[dict]:
+    """
+    Объявления с enrichment, обработка документов которых не завершена: состояния нет
+    или оно failed (success и no_supported_document не возвращаются). Сначала ни разу не
+    обработанные, затем failed; внутри группы самые старые первыми (first_seen_at, id).
+    Объявления, у которых последний refresh enrichment failed, не возвращаются.
+    Каждый dict — результат enrichment_repository.get_announcement_with_enrichment,
+    то есть готов для document_pipeline.process_enriched_announcement.
+    limit=None — все; limit — положительное целое, иначе ValueError.
+    """
+    query = SELECT_PROCESSING_CANDIDATE_URLS
+    params: tuple = ()
+    if limit is not None:
+        # bool — подкласс int, но True/False как лимит — почти наверняка ошибка.
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError(f"limit должен быть положительным целым или None: {limit!r}")
+        query += " LIMIT ?"
+        params = (limit,)
+
+    with _connect(db_path) as conn:
+        urls = [row[0] for row in conn.execute(query, params).fetchall()]
+
+    candidates = []
+    for resource_url in urls:
+        candidate = enrichment_repository.get_announcement_with_enrichment(
+            resource_url, db_path=db_path
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
+def count_document_processing_candidates(db_path=None) -> int:
+    with _connect(db_path) as conn:
+        return conn.execute(COUNT_PROCESSING_CANDIDATES).fetchone()[0]
 
 
 # --- чтение ---

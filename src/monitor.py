@@ -3,8 +3,8 @@
 (sections) с SQLite-хранилищем объявлений (announcement_repository).
 
 Собственной логики парсинга, HTTP, SQL здесь нет — только вызов уже готовых
-функций в нужном порядке и подсчёт сводки. Enrichment (enrichment_pipeline)
-подключён после сохранения объявлений.
+функций в нужном порядке и подсчёт сводки. После сохранения объявлений идут
+enrichment (enrichment_pipeline) и обработка документов (document_pipeline).
 
 Прототип общей страницы (gnumner.fetch_tenders, tender_repository и таблица
 tenders) остаётся в проекте как legacy и этим модулем не используется.
@@ -18,15 +18,33 @@ from src.database.announcement_repository import (
     init_db,
     save_announcements,
 )
-from src.database import enrichment_repository
+from src.database import document_repository, enrichment_repository
+from src.document_pipeline import process_enriched_announcements
 from src.enrichment_pipeline import process_announcements
 from src.scraper.gnumner import configure_tls
 from src.scraper.sections import fetch_all_sections
 
 logger = logging.getLogger(__name__)
 
-# Сколько старых объявлений без enrichment дообрабатывается за один обычный запуск.
+# Сколько старых объявлений без enrichment или с неудавшимся refresh дообрабатывается за один запуск.
 PENDING_ENRICHMENT_RETRY_LIMIT = 3
+
+# Сколько старых объявлений с незавершённой обработкой документов берётся за один запуск
+# (сверх объявлений текущего запуска), чтобы не скачивать весь backlog разом.
+PENDING_DOCUMENT_RETRY_LIMIT = 3
+
+
+def _merge_by_resource_url(current: list[dict], pending: list[dict]) -> list[dict]:
+    candidates = []
+    seen_urls = set()
+    for announcement in [*current, *pending]:
+        resource_url = announcement.get("resource_url")
+        if resource_url:
+            if resource_url in seen_urls:
+                continue
+            seen_urls.add(resource_url)
+        candidates.append(announcement)
+    return candidates
 
 
 def merge_enrichment_candidates(
@@ -38,15 +56,48 @@ def merge_enrichment_candidates(
     Дедупликация по непустому resource_url, при дубле остаётся первая запись.
     Записи без resource_url не дедуплицируются. Исходные списки не изменяются.
     """
+    return _merge_by_resource_url(current_announcements, pending_announcements)
+
+
+def merge_document_candidates(
+    current_candidates: list[dict],
+    pending_candidates: list[dict],
+) -> list[dict]:
+    """
+    Кандидаты на обработку документов: сначала текущий запуск, затем pending.
+    Правила те же, что у merge_enrichment_candidates (первая запись по resource_url
+    побеждает, входные списки не изменяются).
+    """
+    return _merge_by_resource_url(current_candidates, pending_candidates)
+
+
+def _current_document_urls(enrichment_result: dict, updated_announcements: list[dict]) -> list[str]:
+    """
+    resource_url объявлений текущего запуска для обработки документов: успешно
+    прошедшие enrichment (любой enrichment_status) плюс updated. Объявления с ошибкой
+    enrichment исключаются: их enrichment устарел или отсутствует. Порядок сохраняется,
+    дубли и пустые значения убираются.
+    """
+    failed_urls = {failure["resource_url"] for failure in enrichment_result["failures"]}
+    urls = []
+    for resource_url in (
+        [result["resource_url"] for result in enrichment_result["results"]]
+        + [announcement.get("resource_url") for announcement in updated_announcements]
+    ):
+        if resource_url and resource_url not in failed_urls and resource_url not in urls:
+            urls.append(resource_url)
+    return urls
+
+
+def _load_document_candidates(resource_urls: list[str]) -> list[dict]:
+    """Полные объекты (announcement + enrichment + cpv_codes + documents) для document pipeline."""
     candidates = []
-    seen_urls = set()
-    for announcement in [*current_announcements, *pending_announcements]:
-        resource_url = announcement.get("resource_url")
-        if resource_url:
-            if resource_url in seen_urls:
-                continue
-            seen_urls.add(resource_url)
-        candidates.append(announcement)
+    for resource_url in resource_urls:
+        candidate = enrichment_repository.get_announcement_with_enrichment(resource_url)
+        if candidate is None:
+            logger.warning("Нет announcement/enrichment для обработки документов: %s", resource_url)
+            continue
+        candidates.append(candidate)
     return candidates
 
 
@@ -54,7 +105,9 @@ def run_monitor(page: int = 1) -> dict:
     """
     Один проход мониторинга: получить объявления всех разделов, сохранить в базу,
     обогатить новые/обновлённые объявления и до PENDING_ENRICHMENT_RETRY_LIMIT
-    старых объявлений без enrichment.
+    старых объявлений без enrichment или с неудавшимся refresh, затем обработать документы объявлений текущего
+    запуска (успешный enrichment + updated) и до PENDING_DOCUMENT_RETRY_LIMIT старых
+    объявлений с незавершённой обработкой документов.
 
     Ошибки сети и базы намеренно не перехватываются — они поднимаются
     вызывающему коду. (Изоляция ошибок отдельных разделов реализована внутри
@@ -95,8 +148,9 @@ def run_monitor(page: int = 1) -> dict:
     current_for_enrichment = save_result["new_announcements"] + save_result["updated_announcements"]
 
     enrichment_repository.init_db()
-    pending_before = enrichment_repository.count_announcements_without_enrichment()
-    pending_retry = enrichment_repository.get_announcements_without_enrichment(
+    # Кандидаты: без enrichment (первыми) и с failed refresh (у updated старый enrichment остаётся).
+    pending_before = enrichment_repository.count_enrichment_processing_candidates()
+    pending_retry = enrichment_repository.get_enrichment_processing_candidates(
         limit=PENDING_ENRICHMENT_RETRY_LIMIT
     )
     enrichment_candidates = merge_enrichment_candidates(current_for_enrichment, pending_retry)
@@ -106,7 +160,29 @@ def run_monitor(page: int = 1) -> dict:
     )
 
     enrichment_result = process_announcements(enrichment_candidates)
-    pending_after = enrichment_repository.count_announcements_without_enrichment()
+    pending_after = enrichment_repository.count_enrichment_processing_candidates()
+
+    # Документы updated-объявлений обрабатываются заново даже при state success /
+    # no_supported_document: document_url и documents могли измениться.
+    document_repository.init_db()
+    pending_documents_before = document_repository.count_document_processing_candidates()
+    current_document_candidates = _load_document_candidates(
+        _current_document_urls(enrichment_result, save_result["updated_announcements"])
+    )
+    pending_document_retry = document_repository.get_document_processing_candidates(
+        limit=PENDING_DOCUMENT_RETRY_LIMIT
+    )
+    document_candidates = merge_document_candidates(
+        current_document_candidates, pending_document_retry
+    )
+    logger.info(
+        "Документы: кандидатов %d (текущий запуск %d, pending retry %d), pending до обработки %d",
+        len(document_candidates), len(current_document_candidates),
+        len(pending_document_retry), pending_documents_before,
+    )
+
+    document_result = process_enriched_announcements(document_candidates)
+    pending_documents_after = document_repository.count_document_processing_candidates()
 
     return {
         "fetched_count": fetched_count,
@@ -124,6 +200,11 @@ def run_monitor(page: int = 1) -> dict:
         "pending_retry_selected_count": len(pending_retry),
         "enrichment_result": enrichment_result,
         "pending_enrichment_after": pending_after,
+        "document_candidate_count": len(document_candidates),
+        "pending_documents_before": pending_documents_before,
+        "pending_document_retry_selected_count": len(pending_document_retry),
+        "document_result": document_result,
+        "pending_documents_after": pending_documents_after,
     }
 
 
@@ -170,6 +251,40 @@ def _print_enrichment_summary(result: dict):
             print(f"Сообщение: {failure['error_message']}")
 
 
+def _print_document_summary(result: dict):
+    document_result = result["document_result"]
+
+    print()
+    print("Документы:")
+    print()
+    print(f"Кандидатов: {result['document_candidate_count']}")
+    print(f"Pending до обработки: {result['pending_documents_before']}")
+    print(f"Старых pending выбрано: {result['pending_document_retry_selected_count']}")
+    print()
+    print(f"Успешно обработано: {document_result['success_count']}")
+    print(f"Без поддерживаемого документа: {document_result['no_supported_document_count']}")
+    print(f"Ошибок: {document_result['failed_count']}")
+    print()
+    print(f"Новых downloads: {document_result['download_new_count']}")
+    print(f"Существующих downloads: {document_result['download_existing_count']}")
+    print()
+    print(f"Новых extractions: {document_result['extraction_new_count']}")
+    print(f"Обновлённых extractions: {document_result['extraction_updated_count']}")
+    print(f"Существующих extractions: {document_result['extraction_existing_count']}")
+    print()
+    print(f"Pending после обработки: {result['pending_documents_after']}")
+
+    if document_result["failures"]:
+        print()
+        print("Ошибки обработки документов:")
+        for i, failure in enumerate(document_result["failures"], start=1):
+            print()
+            print(f"[{i}]")
+            print(f"URL: {failure['resource_url']}")
+            print(f"Тип ошибки: {failure['error_type']}")
+            print(f"Сообщение: {failure['error_message']}")
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -205,6 +320,7 @@ def main():
         _print_announcements("Изменённые объявления:", result["updated_announcements"])
 
     _print_enrichment_summary(result)
+    _print_document_summary(result)
 
 
 if __name__ == "__main__":

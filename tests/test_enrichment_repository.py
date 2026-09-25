@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -426,6 +427,343 @@ class EnrichmentRepositoryTest(unittest.TestCase):
         self.assertEqual(pending, [make_announcement()])
         for name in ("id", "first_seen_at", "last_seen_at"):
             self.assertNotIn(name, pending[0])
+
+    # --- get_announcement_with_enrichment ---
+
+    def test_combined_contains_resource_type_from_announcements(self):
+        self.save()
+
+        combined = repo.get_announcement_with_enrichment(RESOURCE_URL, self.db_path)
+
+        self.assertEqual(combined["resource_type"], "armeps_documents_page")
+        self.assertNotIn("resource_type", self.get())  # именно поэтому нужен join
+
+    def test_combined_contains_announcement_and_enrichment_fields(self):
+        self.save(make_enrichment(document_url="https://example.test/doc.zip"))
+
+        combined = repo.get_announcement_with_enrichment(RESOURCE_URL, self.db_path)
+
+        expected_names = set(repo.ANNOUNCEMENT_FIELDS) | set(repo.SCALAR_FIELDS) | {
+            "consistency", "cpv_codes", "documents",
+        }
+        self.assertEqual(set(combined), expected_names)
+        for name in repo.ANNOUNCEMENT_FIELDS:
+            self.assertEqual(combined[name], make_announcement()[name])
+        self.assertEqual(combined["enrichment_status"], "success")
+        self.assertEqual(combined["procedure_code"], "TEST-001")
+        self.assertEqual(combined["document_url"], "https://example.test/doc.zip")
+        self.assertEqual(combined["consistency"], {"published_at_match": True, "deadline_at_match": True})
+
+    def test_combined_contains_cpv_codes_and_documents(self):
+        self.save(make_enrichment(cpv_codes=[CPV_A, CPV_B], documents=[DOC_1, DOC_2]))
+
+        combined = repo.get_announcement_with_enrichment(RESOURCE_URL, self.db_path)
+
+        self.assertEqual(combined["cpv_codes"], [CPV_A, CPV_B])
+        self.assertEqual(combined["documents"], [DOC_1, DOC_2])
+
+    def test_combined_without_enrichment_is_none(self):
+        self.assertIsNone(repo.get_announcement_with_enrichment(RESOURCE_URL, self.db_path))
+
+    def test_combined_for_unknown_resource_is_none(self):
+        self.assertIsNone(
+            repo.get_announcement_with_enrichment("https://example.test/unknown", self.db_path)
+        )
+
+    def test_combined_reflects_updated_announcement_type(self):
+        self.save()
+        announcement_repository.save_announcement(
+            make_announcement(resource_type="eauction_tender_page"), self.db_path
+        )
+
+        combined = repo.get_announcement_with_enrichment(RESOURCE_URL, self.db_path)
+
+        self.assertEqual(combined["resource_type"], "eauction_tender_page")
+
+    # --- enrichment_processing_state ---
+
+    def state(self, url=RESOURCE_URL):
+        return repo.get_enrichment_processing_state(url, self.db_path)
+
+    def save_state(self, url, status, **kwargs):
+        repo.save_enrichment_processing_state(url, status, db_path=self.db_path, **kwargs)
+
+    def test_init_db_creates_processing_state_table(self):
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            columns = [
+                (row[1], row[2], row[3], row[5])
+                for row in conn.execute("PRAGMA table_info(enrichment_processing_state)")
+            ]
+            foreign_keys = conn.execute(
+                "PRAGMA foreign_key_list(enrichment_processing_state)"
+            ).fetchall()
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'enrichment_processing_state'"
+            ).fetchone()[0]
+
+        self.assertEqual(columns, [
+            ("resource_url", "TEXT", 0, 1),
+            ("status", "TEXT", 1, 0),
+            ("last_attempt_at", "TEXT", 1, 0),
+            ("error_type", "TEXT", 0, 0),
+            ("error_message", "TEXT", 0, 0),
+        ])
+        self.assertEqual([(fk[2], fk[3], fk[4]) for fk in foreign_keys], [
+            ("announcements", "resource_url", "resource_url"),
+        ])
+        self.assertNotIn("CHECK", sql.upper())
+
+    def test_init_db_keeps_existing_states(self):
+        self.save_state(RESOURCE_URL, "failed", error_type="E", error_message="m")
+
+        repo.init_db(self.db_path)
+
+        self.assertEqual(self.state()["status"], "failed")
+
+    def test_init_db_adds_state_table_to_legacy_db(self):
+        legacy_path = Path(self._tmp.name) / "legacy.db"
+        announcement_repository.init_db(legacy_path)
+        with closing(sqlite3.connect(legacy_path)) as conn, conn:
+            conn.execute(repo.CREATE_ENRICHMENT_TABLE)  # БД до появления таблицы состояния
+
+        repo.init_db(legacy_path)
+
+        self.assertIsNone(repo.get_enrichment_processing_state(RESOURCE_URL, legacy_path))
+
+    def test_success_state_round_trip(self):
+        self.save_state(RESOURCE_URL, "success")
+
+        state = self.state()
+
+        self.assertEqual(state["resource_url"], RESOURCE_URL)
+        self.assertEqual(state["status"], "success")
+        self.assertIsNone(state["error_type"])
+        self.assertIsNone(state["error_message"])
+        self.assertIsNotNone(datetime.fromisoformat(state["last_attempt_at"]).tzinfo)
+
+    def test_failed_state_round_trip(self):
+        self.save_state(RESOURCE_URL, "failed", error_type="RuntimeError", error_message="сбой")
+
+        state = self.state()
+
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["error_type"], "RuntimeError")
+        self.assertEqual(state["error_message"], "сбой")
+
+    def test_success_after_failed_clears_error_fields(self):
+        self.save_state(RESOURCE_URL, "failed", error_type="RuntimeError", error_message="сбой")
+
+        self.save_state(RESOURCE_URL, "success")
+
+        state = self.state()
+        self.assertEqual(state["status"], "success")
+        self.assertIsNone(state["error_type"])
+        self.assertIsNone(state["error_message"])
+        self.assertEqual(self.count_rows("enrichment_processing_state"), 1)
+
+    def test_failed_after_success_keeps_single_row(self):
+        self.save_state(RESOURCE_URL, "success")
+
+        self.save_state(RESOURCE_URL, "failed", error_type="E", error_message="m")
+
+        self.assertEqual(self.state()["status"], "failed")
+        self.assertEqual(self.count_rows("enrichment_processing_state"), 1)
+
+    def test_last_attempt_at_is_refreshed(self):
+        self.save_state(RESOURCE_URL, "failed", error_type="E", error_message="m")
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute("UPDATE enrichment_processing_state SET last_attempt_at = '2000-01-01T00:00:00+00:00'")
+
+        self.save_state(RESOURCE_URL, "success")
+
+        self.assertGreater(self.state()["last_attempt_at"], "2000-01-01T00:00:00+00:00")
+
+    def test_saving_state_keeps_existing_enrichment_untouched(self):
+        self.save(make_enrichment(cpv_codes=[CPV_A], documents=[DOC_1]))
+        before = self.get()
+
+        self.save_state(RESOURCE_URL, "failed", error_type="E", error_message="m")
+
+        self.assertEqual(self.get(), before)
+
+    def test_state_for_unknown_announcement_raises(self):
+        with self.assertRaises(ValueError):
+            self.save_state("https://example.test/unknown", "success")
+        self.assertEqual(self.count_rows("enrichment_processing_state"), 0)
+
+    def test_blank_resource_url_or_status_raises(self):
+        for url, status in ((None, "success"), ("", "success"), ("  ", "success"),
+                            (RESOURCE_URL, None), (RESOURCE_URL, ""), (RESOURCE_URL, "  ")):
+            with self.subTest(url=url, status=status):
+                with self.assertRaises(ValueError):
+                    self.save_state(url, status)
+
+    def test_missing_state_is_none(self):
+        self.assertIsNone(self.state())
+        self.assertIsNone(self.state("https://example.test/unknown"))
+
+    # --- get_enrichment_processing_candidates ---
+
+    def candidate_urls(self, **kwargs) -> list[str]:
+        candidates = repo.get_enrichment_processing_candidates(self.db_path, **kwargs)
+        return [item["resource_url"] for item in candidates]
+
+    def url(self, number) -> str:
+        return f"https://example.test/resource/{number}"
+
+    def add_enriched(self, number, first_seen_at=None) -> str:
+        """Объявление с enrichment (как после успешной обработки)."""
+        url = self.add_announcement(number, first_seen_at)
+        self.save(make_enrichment(), url)
+        return url
+
+    def test_candidate_without_enrichment_and_state(self):
+        self.assertEqual(self.candidate_urls(), [RESOURCE_URL])
+
+    def test_candidate_without_enrichment_regardless_of_state(self):
+        for status in ("failed", "success"):
+            with self.subTest(status=status):
+                url = self.add_announcement(status)
+                self.save_state(url, status)
+
+                self.assertIn(url, self.candidate_urls())
+
+    def test_enrichment_with_success_state_is_not_candidate(self):
+        self.save()
+        self.save_state(RESOURCE_URL, "success")
+
+        self.assertEqual(self.candidate_urls(), [])
+
+    def test_enrichment_without_state_is_not_candidate(self):
+        # Строки enrichment, сохранённые до появления таблицы состояния.
+        self.save()
+
+        self.assertEqual(self.candidate_urls(), [])
+
+    def test_enrichment_with_failed_state_is_candidate(self):
+        # updated-объявление: старый enrichment остался, refresh упал.
+        self.save()
+        self.save_state(RESOURCE_URL, "failed", error_type="E", error_message="m")
+
+        self.assertEqual(self.candidate_urls(), [RESOURCE_URL])
+
+    def test_candidate_disappears_after_success_state(self):
+        self.save()
+        self.save_state(RESOURCE_URL, "failed", error_type="E", error_message="m")
+        self.assertEqual(self.candidate_urls(), [RESOURCE_URL])
+
+        self.save_state(RESOURCE_URL, "success")
+
+        self.assertEqual(self.candidate_urls(), [])
+
+    def test_any_enrichment_status_with_success_state_is_not_candidate(self):
+        for status in ("success", "partial", "not_required", "unsupported"):
+            with self.subTest(status=status):
+                url = self.add_announcement(status)
+                self.save(make_enrichment(enrichment_status=status), url)
+                self.save_state(url, "success")
+
+                self.assertNotIn(url, self.candidate_urls())
+
+    def test_missing_enrichment_goes_before_failed_refresh_even_if_newer(self):
+        # RESOURCE_URL — самый старый и failed; новые без enrichment всё равно первые.
+        self.save()
+        self.save_state(RESOURCE_URL, "failed", error_type="E", error_message="m")
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute(
+                "UPDATE announcements SET first_seen_at = '2026-01-01T00:00:00+00:00' "
+                "WHERE resource_url = ?",
+                (RESOURCE_URL,),
+            )
+        url_b = self.add_announcement("b", "2026-09-02T00:00:00+00:00")
+        url_c = self.add_announcement("c", "2026-09-01T00:00:00+00:00")
+
+        self.assertEqual(self.candidate_urls(), [url_c, url_b, RESOURCE_URL])
+
+    def test_order_inside_groups_is_first_seen_at_then_id(self):
+        self.save()
+        self.save_state(RESOURCE_URL, "failed", error_type="E", error_message="m")
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute(
+                "UPDATE announcements SET first_seen_at = '2026-09-03T00:00:00+00:00' "
+                "WHERE resource_url = ?",
+                (RESOURCE_URL,),
+            )
+        missing_b = self.add_announcement("b", "2026-09-01T00:00:00+00:00")
+        missing_c = self.add_announcement("c", "2026-09-01T00:00:00+00:00")  # тот же день: по id
+        failed_d = self.add_enriched("d", "2026-09-02T00:00:00+00:00")
+        self.save_state(failed_d, "failed", error_type="E", error_message="m")
+        failed_e = self.add_enriched("e", "2026-09-02T00:00:00+00:00")
+        self.save_state(failed_e, "failed", error_type="E", error_message="m")
+
+        self.assertEqual(
+            self.candidate_urls(), [missing_b, missing_c, failed_d, failed_e, RESOURCE_URL]
+        )
+
+    def test_old_failed_refresh_does_not_block_new_unenriched_with_limit(self):
+        failed = []
+        for number in (2, 3, 4):
+            url = self.add_enriched(number, f"2026-08-0{number}T00:00:00+00:00")
+            self.save_state(url, "failed", error_type="E", error_message="m")
+            failed.append(url)
+        new_a = self.add_announcement("new_a", "2026-09-01T00:00:00+00:00")
+        new_b = self.add_announcement("new_b", "2026-09-02T00:00:00+00:00")
+        # RESOURCE_URL тоже без enrichment, но появился раньше остальных новых.
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute(
+                "UPDATE announcements SET first_seen_at = '2026-08-31T00:00:00+00:00' "
+                "WHERE resource_url = ?",
+                (RESOURCE_URL,),
+            )
+
+        self.assertEqual(self.candidate_urls(limit=3), [RESOURCE_URL, new_a, new_b])
+        self.assertEqual(self.candidate_urls(limit=4), [RESOURCE_URL, new_a, new_b, failed[0]])
+
+    def test_candidates_limit(self):
+        for number in (2, 3):
+            self.add_announcement(number)
+
+        self.assertEqual(len(self.candidate_urls(limit=1)), 1)
+        self.assertEqual(len(self.candidate_urls(limit=2)), 2)
+        self.assertEqual(len(self.candidate_urls(limit=10)), 3)
+        self.assertEqual(len(self.candidate_urls(limit=None)), 3)
+        self.assertEqual(len(self.candidate_urls()), 3)
+
+    def test_candidates_invalid_limit_raises(self):
+        for limit in (0, -1, True, False, 1.5, "3", "1; DROP TABLE announcements"):
+            with self.subTest(limit=limit):
+                with self.assertRaises(ValueError):
+                    repo.get_enrichment_processing_candidates(self.db_path, limit=limit)
+
+        self.assertEqual(self.count_rows("announcements"), 1)
+
+    def test_candidate_dict_has_announcement_fields_for_enrich_announcement(self):
+        candidates = repo.get_enrichment_processing_candidates(self.db_path)
+
+        self.assertEqual(candidates, [make_announcement()])
+        for name in ("id", "first_seen_at", "last_seen_at"):
+            self.assertNotIn(name, candidates[0])
+
+    def test_count_processing_candidates_matches_query_without_limit(self):
+        self.assertEqual(repo.count_enrichment_processing_candidates(self.db_path), 1)
+
+        url_2 = self.add_enriched(2)
+        url_3 = self.add_enriched(3)
+        url_4 = self.add_announcement(4)
+        self.save_state(url_2, "success")
+        self.save_state(url_3, "failed", error_type="E", error_message="m")
+        self.save_state(url_4, "success")  # enrichment нет — всё равно кандидат
+
+        self.assertEqual(repo.count_enrichment_processing_candidates(self.db_path), 3)
+        self.assertEqual(len(self.candidate_urls()), 3)
+
+    def test_legacy_pending_function_is_unchanged_by_failed_state(self):
+        self.save()
+        self.save_state(RESOURCE_URL, "failed", error_type="E", error_message="m")
+
+        # Старая функция по-прежнему про «нет строки enrichment» и failed refresh не видит.
+        self.assertEqual(self.pending_urls(), [])
+        self.assertEqual(repo.count_announcements_without_enrichment(self.db_path), 0)
 
 
 if __name__ == "__main__":

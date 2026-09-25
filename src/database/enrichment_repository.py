@@ -6,6 +6,12 @@ announcement_cpv, announcement_documents) на стандартном sqlite3.
 Таблица announcements здесь только читается: модуль проверяет, что объявление
 существует, но не изменяет его. Общий у модулей только файл БД.
 
+enrichment_processing_state — итог последней попытки enrichment объявления (по одной строке
+на resource_url): success или failed (SQL CHECK намеренно нет). Она нужна потому, что при
+неудачном повторном enrichment обновлённого объявления старая валидная строка
+announcement_enrichment остаётся, и по одной этой таблице «refresh не удался» не понять.
+По состоянию get_enrichment_processing_candidates находит объявления для повторной попытки.
+
 Семантика необязательных списков:
 - ключа "cpv_codes" / "documents" нет (или значение None) -> старые строки не трогаем;
 - пустой список []                                         -> старые строки удаляем;
@@ -26,6 +32,9 @@ logger = logging.getLogger(__name__)
 STATUS_NEW = announcement_repository.STATUS_NEW
 STATUS_UPDATED = announcement_repository.STATUS_UPDATED
 STATUS_EXISTING = announcement_repository.STATUS_EXISTING
+
+PROCESSING_SUCCESS = "success"
+PROCESSING_FAILED = "failed"
 
 # Скалярные поля enrichment, которые сохраняются как есть.
 SCALAR_FIELDS = (
@@ -131,6 +140,28 @@ SET {', '.join(f'{name} = ?' for name in COMPARED_FIELDS)}, enriched_at = ?
 WHERE resource_url = ?
 """
 
+CREATE_PROCESSING_STATE_TABLE = """
+CREATE TABLE IF NOT EXISTS enrichment_processing_state (
+    resource_url    TEXT PRIMARY KEY,
+    status          TEXT NOT NULL,
+    last_attempt_at TEXT NOT NULL,
+    error_type      TEXT,
+    error_message   TEXT,
+    FOREIGN KEY (resource_url) REFERENCES announcements (resource_url)
+)
+"""
+
+UPSERT_PROCESSING_STATE = """
+INSERT INTO enrichment_processing_state (
+    resource_url, status, last_attempt_at, error_type, error_message
+) VALUES (?, ?, ?, ?, ?)
+ON CONFLICT (resource_url) DO UPDATE SET
+    status = excluded.status,
+    last_attempt_at = excluded.last_attempt_at,
+    error_type = excluded.error_type,
+    error_message = excluded.error_message
+"""
+
 SELECT_CPV = "SELECT code, name FROM announcement_cpv WHERE resource_url = ? ORDER BY id"
 DELETE_CPV = "DELETE FROM announcement_cpv WHERE resource_url = ?"
 INSERT_CPV = "INSERT INTO announcement_cpv (resource_url, code, name) VALUES (?, ?, ?)"
@@ -153,6 +184,29 @@ SELECT_WITHOUT_ENRICHMENT = (
 )
 
 COUNT_WITHOUT_ENRICHMENT = f"SELECT COUNT(*) {FROM_WITHOUT_ENRICHMENT}"
+
+# Кандидаты на enrichment: enrichment нет вовсе (state не важен) ИЛИ последняя попытка
+# failed (обновлённое объявление с прежним enrichment). state = success с существующим
+# enrichment кандидатом не является.
+FROM_PROCESSING_CANDIDATES = """
+FROM announcements
+LEFT JOIN announcement_enrichment
+    ON announcement_enrichment.resource_url = announcements.resource_url
+LEFT JOIN enrichment_processing_state
+    ON enrichment_processing_state.resource_url = announcements.resource_url
+WHERE announcement_enrichment.resource_url IS NULL
+    OR enrichment_processing_state.status = 'failed'
+"""
+
+# Сначала без enrichment, затем failed refresh: старые failed не блокируют новые объявления.
+SELECT_PROCESSING_CANDIDATES = (
+    f"SELECT {', '.join(f'announcements.{name}' for name in ANNOUNCEMENT_FIELDS)} "
+    f"{FROM_PROCESSING_CANDIDATES} "
+    "ORDER BY CASE WHEN announcement_enrichment.resource_url IS NULL THEN 0 ELSE 1 END ASC, "
+    "announcements.first_seen_at ASC, announcements.id ASC"
+)
+
+COUNT_PROCESSING_CANDIDATES = f"SELECT COUNT(*) {FROM_PROCESSING_CANDIDATES}"
 
 DELETE_DOCUMENTS = "DELETE FROM announcement_documents WHERE resource_url = ?"
 INSERT_DOCUMENT = f"""
@@ -181,13 +235,14 @@ def _connect(db_path=None):
 
 
 def init_db(db_path=None) -> Path:
-    """Создаёт announcements (если нет) и три таблицы enrichment. Данные не изменяет."""
+    """Создаёт announcements (если нет), три таблицы enrichment и таблицу состояния. Данные не изменяет."""
     path = announcement_repository.init_db(db_path)
 
     with _connect(path) as conn:
         conn.execute(CREATE_ENRICHMENT_TABLE)
         conn.execute(CREATE_CPV_TABLE)
         conn.execute(CREATE_DOCUMENTS_TABLE)
+        conn.execute(CREATE_PROCESSING_STATE_TABLE)
 
     logger.info("Таблицы enrichment готовы: %s", path)
     return path
@@ -327,19 +382,38 @@ def get_enrichment(resource_url: str, db_path=None) -> dict | None:
     return result
 
 
+def get_announcement_with_enrichment(resource_url: str, db_path=None) -> dict | None:
+    """
+    Объединённый объект для document pipeline: поля announcements (в т.ч. resource_type,
+    которого нет в get_enrichment) + скалярные поля enrichment + consistency, cpv_codes,
+    documents. Без enrichment (или без объявления) возвращает None.
+    Поля announcement и enrichment не пересекаются, кроме resource_url (значение одно).
+    """
+    enrichment = get_enrichment(resource_url, db_path=db_path)
+    if enrichment is None:
+        return None
+
+    announcement = announcement_repository.get_announcement_by_resource_url(
+        resource_url, db_path=db_path
+    )
+    if announcement is None:
+        return None
+
+    result = {name: announcement[name] for name in ANNOUNCEMENT_FIELDS}
+    result.update({name: enrichment[name] for name in SCALAR_FIELDS})
+    result["consistency"] = enrichment["consistency"]
+    result["cpv_codes"] = enrichment["cpv_codes"]
+    result["documents"] = enrichment["documents"]
+    return result
+
+
 def count_enrichments(db_path=None) -> int:
     with _connect(db_path) as conn:
         return conn.execute("SELECT COUNT(*) FROM announcement_enrichment").fetchone()[0]
 
 
-def get_announcements_without_enrichment(db_path=None, limit: int | None = None) -> list[dict]:
-    """
-    Объявления, для которых строки в announcement_enrichment ещё нет (самые старые первыми).
-    Любой статус enrichment (success, partial, not_required, unsupported) — не pending.
-    Каждый dict совместим с enrich_announcement(announcement).
-    limit=None — все; limit — положительное целое, иначе ValueError.
-    """
-    query = SELECT_WITHOUT_ENRICHMENT
+def _select_announcements(query: str, limit: int | None, db_path) -> list[dict]:
+    """Выполняет запрос с необязательным parameterized LIMIT; dict совместим с enrich_announcement."""
     params: tuple = ()
     if limit is not None:
         # bool — подкласс int, но True/False как лимит — почти наверняка ошибка.
@@ -355,6 +429,74 @@ def get_announcements_without_enrichment(db_path=None, limit: int | None = None)
     return [{name: row[name] for name in ANNOUNCEMENT_FIELDS} for row in rows]
 
 
+def get_announcements_without_enrichment(db_path=None, limit: int | None = None) -> list[dict]:
+    """
+    Объявления, для которых строки в announcement_enrichment ещё нет (самые старые первыми).
+    Любой статус enrichment (success, partial, not_required, unsupported) — не pending.
+    Каждый dict совместим с enrich_announcement(announcement).
+    limit=None — все; limit — положительное целое, иначе ValueError.
+    """
+    return _select_announcements(SELECT_WITHOUT_ENRICHMENT, limit, db_path)
+
+
 def count_announcements_without_enrichment(db_path=None) -> int:
     with _connect(db_path) as conn:
         return conn.execute(COUNT_WITHOUT_ENRICHMENT).fetchone()[0]
+
+
+def save_enrichment_processing_state(
+    resource_url: str,
+    status: str,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    db_path=None,
+) -> None:
+    """
+    Upsert по resource_url; last_attempt_at — текущее UTC-время (timezone-aware).
+    Все поля строки перезаписываются: успешная попытка очищает прежнюю ошибку.
+    announcement_enrichment не изменяется (старый валидный enrichment сохраняется).
+    ValueError — пустой resource_url/status или нет объявления в announcements.
+    """
+    if _is_blank(resource_url):
+        raise ValueError("resource_url не может быть пустым")
+    if _is_blank(status):
+        raise ValueError(f"У состояния enrichment отсутствует status: {resource_url}")
+
+    with _connect(db_path) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM announcements WHERE resource_url = ?", (resource_url,)
+        ).fetchone()
+        if exists is None:
+            raise ValueError(f"Объявление не найдено в announcements: {resource_url}")
+
+        conn.execute(
+            UPSERT_PROCESSING_STATE,
+            (resource_url, status, _utc_now(), error_type, error_message),
+        )
+
+    logger.info("Состояние enrichment сохранено (%s): %s", status, resource_url)
+
+
+def get_enrichment_processing_state(resource_url: str, db_path=None) -> dict | None:
+    with _connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM enrichment_processing_state WHERE resource_url = ?", (resource_url,)
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_enrichment_processing_candidates(db_path=None, limit: int | None = None) -> list[dict]:
+    """
+    Объявления, которым нужен (повторный) enrichment: enrichment отсутствует (любое состояние)
+    или последняя попытка failed. Сначала без enrichment, затем failed refresh; внутри группы
+    самые старые первыми (first_seen_at, id). Объявления со state = success и существующим
+    enrichment не возвращаются. Каждый dict совместим с enrich_announcement(announcement).
+    limit=None — все; limit — положительное целое, иначе ValueError.
+    """
+    return _select_announcements(SELECT_PROCESSING_CANDIDATES, limit, db_path)
+
+
+def count_enrichment_processing_candidates(db_path=None) -> int:
+    with _connect(db_path) as conn:
+        return conn.execute(COUNT_PROCESSING_CANDIDATES).fetchone()[0]
