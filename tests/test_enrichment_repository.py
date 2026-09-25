@@ -343,6 +343,90 @@ class EnrichmentRepositoryTest(unittest.TestCase):
 
         self.assertEqual(repo.count_enrichments(self.db_path), 2)
 
+    # --- announcements без enrichment (pending) ---
+
+    def add_announcement(self, number, first_seen_at=None):
+        url = f"https://example.test/resource/{number}"
+        announcement_repository.save_announcement(
+            make_announcement(resource_url=url, title=f"Объявление {number}"), self.db_path
+        )
+        if first_seen_at is not None:
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
+                conn.execute(
+                    "UPDATE announcements SET first_seen_at = ? WHERE resource_url = ?",
+                    (first_seen_at, url),
+                )
+        return url
+
+    def pending_urls(self, **kwargs):
+        pending = repo.get_announcements_without_enrichment(self.db_path, **kwargs)
+        return [item["resource_url"] for item in pending]
+
+    def test_announcement_without_enrichment_is_pending(self):
+        self.assertEqual(self.pending_urls(), [RESOURCE_URL])
+
+    def test_saved_enrichment_is_not_pending(self):
+        self.save()
+        self.assertEqual(self.pending_urls(), [])
+
+    def test_any_enrichment_status_is_not_pending(self):
+        for status in ("success", "partial", "not_required", "unsupported"):
+            with self.subTest(status=status):
+                url = self.add_announcement(status)
+                self.assertIn(url, self.pending_urls())
+
+                self.save(make_enrichment(enrichment_status=status), url)
+
+                self.assertNotIn(url, self.pending_urls())
+
+    def test_pending_ordered_by_first_seen_at_then_id(self):
+        # RESOURCE_URL (id=1) получает самую позднюю дату; b и c — одинаковую дату, порядок по id.
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute(
+                "UPDATE announcements SET first_seen_at = '2026-09-03T00:00:00+00:00' "
+                "WHERE resource_url = ?",
+                (RESOURCE_URL,),
+            )
+        url_b = self.add_announcement("b", "2026-09-01T00:00:00+00:00")
+        url_c = self.add_announcement("c", "2026-09-01T00:00:00+00:00")
+        url_d = self.add_announcement("d", "2026-09-02T00:00:00+00:00")
+
+        self.assertEqual(self.pending_urls(), [url_b, url_c, url_d, RESOURCE_URL])
+
+    def test_limit_one_returns_single_oldest(self):
+        self.add_announcement(2)
+        self.assertEqual(self.pending_urls(limit=1), [RESOURCE_URL])
+
+    def test_limit_none_returns_all(self):
+        for number in (2, 3):
+            self.add_announcement(number)
+        self.assertEqual(len(self.pending_urls(limit=None)), 3)
+        self.assertEqual(len(self.pending_urls()), 3)
+
+    def test_non_positive_limit_raises(self):
+        for limit in (0, -1):
+            with self.subTest(limit=limit):
+                with self.assertRaises(ValueError):
+                    repo.get_announcements_without_enrichment(self.db_path, limit=limit)
+
+    def test_count_announcements_without_enrichment(self):
+        self.assertEqual(repo.count_announcements_without_enrichment(self.db_path), 1)
+
+        url_2 = self.add_announcement(2)
+        self.add_announcement(3)
+        self.assertEqual(repo.count_announcements_without_enrichment(self.db_path), 3)
+
+        self.save()
+        self.save(make_enrichment(enrichment_status="unsupported"), url_2)
+        self.assertEqual(repo.count_announcements_without_enrichment(self.db_path), 1)
+
+    def test_pending_dict_has_announcement_fields_for_enrich_announcement(self):
+        pending = repo.get_announcements_without_enrichment(self.db_path)
+
+        self.assertEqual(pending, [make_announcement()])
+        for name in ("id", "first_seen_at", "last_seen_at"):
+            self.assertNotIn(name, pending[0])
+
 
 if __name__ == "__main__":
     unittest.main()

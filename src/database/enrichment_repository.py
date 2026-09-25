@@ -54,6 +54,19 @@ COMPARED_FIELDS = SCALAR_FIELDS + MATCH_FIELDS
 
 DOCUMENT_FIELDS = ("document_id", "filename", "language", "title", "description")
 
+# Поля announcement, которые ожидает enrich_announcement (id и first/last_seen_at не нужны).
+ANNOUNCEMENT_FIELDS = (
+    "title",
+    "source_section",
+    "source_section_name",
+    "source_page_url",
+    "resource_url",
+    "resource_type",
+    "published_at",
+    "deadline_at",
+    "tender_time_raw",
+)
+
 CREATE_ENRICHMENT_TABLE = """
 CREATE TABLE IF NOT EXISTS announcement_enrichment (
     resource_url          TEXT PRIMARY KEY,
@@ -126,6 +139,21 @@ SELECT_DOCUMENTS = (
     f"SELECT {', '.join(DOCUMENT_FIELDS)} FROM announcement_documents "
     "WHERE resource_url = ? ORDER BY id"
 )
+FROM_WITHOUT_ENRICHMENT = """
+FROM announcements
+LEFT JOIN announcement_enrichment
+    ON announcement_enrichment.resource_url = announcements.resource_url
+WHERE announcement_enrichment.resource_url IS NULL
+"""
+
+SELECT_WITHOUT_ENRICHMENT = (
+    f"SELECT {', '.join(f'announcements.{name}' for name in ANNOUNCEMENT_FIELDS)} "
+    f"{FROM_WITHOUT_ENRICHMENT} "
+    "ORDER BY announcements.first_seen_at ASC, announcements.id ASC"
+)
+
+COUNT_WITHOUT_ENRICHMENT = f"SELECT COUNT(*) {FROM_WITHOUT_ENRICHMENT}"
+
 DELETE_DOCUMENTS = "DELETE FROM announcement_documents WHERE resource_url = ?"
 INSERT_DOCUMENT = f"""
 INSERT INTO announcement_documents (resource_url, {', '.join(DOCUMENT_FIELDS)})
@@ -302,3 +330,31 @@ def get_enrichment(resource_url: str, db_path=None) -> dict | None:
 def count_enrichments(db_path=None) -> int:
     with _connect(db_path) as conn:
         return conn.execute("SELECT COUNT(*) FROM announcement_enrichment").fetchone()[0]
+
+
+def get_announcements_without_enrichment(db_path=None, limit: int | None = None) -> list[dict]:
+    """
+    Объявления, для которых строки в announcement_enrichment ещё нет (самые старые первыми).
+    Любой статус enrichment (success, partial, not_required, unsupported) — не pending.
+    Каждый dict совместим с enrich_announcement(announcement).
+    limit=None — все; limit — положительное целое, иначе ValueError.
+    """
+    query = SELECT_WITHOUT_ENRICHMENT
+    params: tuple = ()
+    if limit is not None:
+        # bool — подкласс int, но True/False как лимит — почти наверняка ошибка.
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError(f"limit должен быть положительным целым или None: {limit!r}")
+        query += " LIMIT ?"
+        params = (limit,)
+
+    with _connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(query, params).fetchall()
+
+    return [{name: row[name] for name in ANNOUNCEMENT_FIELDS} for row in rows]
+
+
+def count_announcements_without_enrichment(db_path=None) -> int:
+    with _connect(db_path) as conn:
+        return conn.execute(COUNT_WITHOUT_ENRICHMENT).fetchone()[0]
