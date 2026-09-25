@@ -11,6 +11,7 @@ import sys
 import warnings
 
 import requests
+import truststore
 from urllib3.exceptions import InsecureRequestWarning
 
 URL = "https://gnumner.minfin.am/ru/page/obyavleniya_o_zakupkakh_/"
@@ -60,8 +61,15 @@ def probe_site():
     except requests.exceptions.SSLError as e:
         print(f"SSL/TLS ошибка при verify=True: {e}")
         print(
-            "Запускаю диагностический запрос с verify=False "
-            "только для проверки доступности сайта."
+            "Пробую диагностическое соединение через truststore "
+            "(системное хранилище сертификатов ОС), проверка сертификата остаётся включённой."
+        )
+        if _probe_with_truststore():
+            return
+
+        print(
+            "truststore тоже не помог. Запускаю диагностический запрос "
+            "с verify=False только для сравнения результатов."
         )
         _probe_with_verify_disabled()
         return
@@ -71,6 +79,47 @@ def probe_site():
 
     print_diagnostics(response)
     save_if_ok(response)
+
+
+def _probe_with_truststore() -> bool:
+    """
+    Диагностическая попытка: verify=True, но источник доверенных
+    сертификатов — системное хранилище Windows (Schannel/CryptoAPI),
+    а не файл certifi.
+
+    truststore.inject_into_ssl() подменяет ssl.SSLContext так, чтобы
+    requests/urllib3 при создании TLS-контекста использовали нативную
+    проверку сертификата средствами ОС — то же самое хранилище, которым
+    пользуется, например, curl на Windows. Проверка сертификата НЕ
+    отключается: если сертификат сайта в принципе невалиден, запрос
+    всё равно упадёт с ошибкой.
+
+    truststore.extract_from_ssl() возвращает ssl.SSLContext к
+    состоянию по умолчанию (certifi), чтобы подмена не влияла на
+    остальной код скрипта (в частности, на диагностический fallback
+    с verify=False).
+    """
+    truststore.inject_into_ssl()
+    response = None
+    try:
+        response = requests.get(URL, headers=HEADERS, timeout=TIMEOUT, verify=True)
+    except requests.exceptions.SSLError as e:
+        print(f"SSL/TLS ошибка при verify=True через truststore: {e}")
+    except requests.exceptions.RequestException as e:
+        print(f"Ошибка запроса через truststore: {e}")
+    finally:
+        truststore.extract_from_ssl()
+
+    if response is None:
+        return False
+
+    print("Безопасное TLS-соединение через системное хранилище сертификатов работает.")
+    print(f"HTTP status code: {response.status_code}")
+    print(f"Конечный URL: {response.url}")
+    print(f"Content-Type: {response.headers.get('Content-Type')}")
+    print(f"Encoding: {response.encoding}")
+    print(f"Размер HTML: {len(response.text)} символов")
+    return True
 
 
 def _probe_with_verify_disabled():
