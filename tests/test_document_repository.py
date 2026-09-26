@@ -75,6 +75,40 @@ def make_zip_result(documents=(), skipped_members=(), failures=()) -> dict:
     }
 
 
+def make_xlsx_result(text="[Sheet: Lot]\nItem\tQty\nBolt\t10", **overrides) -> dict:
+    result = {
+        "file_type": "xlsx",
+        "text": text,
+        "char_count": len(text),
+        "sheet_count": 1,
+        "row_count": 2,
+        "cell_count": 4,
+    }
+    result.update(overrides)
+    return result
+
+
+# Схема document_extractions до поддержки XLSX (без sheet_count / row_count / cell_count).
+OLD_EXTRACTIONS_TABLE = """
+CREATE TABLE document_extractions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    download_id       INTEGER NOT NULL,
+    member_name       TEXT NOT NULL DEFAULT '',
+    file_type         TEXT,
+    extraction_status TEXT NOT NULL,
+    text              TEXT,
+    char_count        INTEGER,
+    paragraph_count   INTEGER,
+    table_count       INTEGER,
+    error_type        TEXT,
+    error_message     TEXT,
+    extracted_at      TEXT NOT NULL,
+    FOREIGN KEY (download_id) REFERENCES document_downloads (id) ON DELETE CASCADE,
+    UNIQUE (download_id, member_name)
+)
+"""
+
+
 class DocumentRepositoryTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -485,6 +519,142 @@ class DocumentRepositoryTest(unittest.TestCase):
 
         self.assertEqual(repo.count_extractions(self.db_path), 0)
 
+    # --- XLSX ---
+
+    def column_names(self, table="document_extractions"):
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+
+    def test_fresh_schema_has_xlsx_metric_columns(self):
+        columns = self.column_names()
+        for name in ("sheet_count", "row_count", "cell_count"):
+            self.assertIn(name, columns)
+
+    def test_xlsx_metrics_round_trip(self):
+        download_id = self.new_download_id()
+
+        counts = repo.save_xlsx_extraction(download_id, make_xlsx_result(), self.db_path)
+
+        self.assertEqual(counts, {"new_count": 1, "updated_count": 0, "existing_count": 0})
+        [row] = self.extractions(download_id)
+        self.assertEqual(row["member_name"], "")
+        self.assertEqual(row["file_type"], "xlsx")
+        self.assertEqual(row["extraction_status"], "success")
+        self.assertEqual(row["text"], "[Sheet: Lot]\nItem\tQty\nBolt\t10")
+        self.assertEqual(row["char_count"], len(row["text"]))
+        self.assertEqual((row["sheet_count"], row["row_count"], row["cell_count"]), (1, 2, 4))
+        self.assertIsNone(row["paragraph_count"])
+        self.assertIsNone(row["table_count"])
+
+    def test_docx_row_keeps_its_metrics_and_has_no_xlsx_metrics(self):
+        download_id = self.new_download_id()
+        repo.save_docx_extraction(download_id, make_docx_result(), self.db_path)
+
+        [row] = self.extractions(download_id)
+        self.assertEqual((row["paragraph_count"], row["table_count"]), (2, 1))
+        self.assertEqual(
+            (row["sheet_count"], row["row_count"], row["cell_count"]), (None, None, None)
+        )
+
+    def test_zip_saves_docx_and_xlsx_metrics_with_nested_member_names(self):
+        download_id = self.new_download_id()
+        result = make_zip_result(
+            documents=[
+                {"member_name": "hraver.docx", **make_docx_result("Первый")},
+                {"member_name": "lot_1.zip!/spec.xlsx", **make_xlsx_result(sheet_count=3)},
+            ],
+            skipped_members=["lot_1.zip!/scan.pdf"],
+            failures=[{
+                "member_name": "lot_2.zip", "error_type": "BadZipFile", "error_message": "x",
+            }],
+        )
+
+        counts = repo.save_zip_extraction(download_id, result, self.db_path)
+
+        self.assertEqual(counts["new_count"], 4)
+        by_name = {r["member_name"]: r for r in self.extractions(download_id)}
+        docx = by_name["hraver.docx"]
+        self.assertEqual((docx["paragraph_count"], docx["table_count"]), (2, 1))
+        self.assertIsNone(docx["sheet_count"])
+        xlsx = by_name["lot_1.zip!/spec.xlsx"]
+        self.assertEqual(xlsx["file_type"], "xlsx")
+        self.assertEqual((xlsx["sheet_count"], xlsx["row_count"], xlsx["cell_count"]), (3, 2, 4))
+        self.assertIsNone(xlsx["paragraph_count"])
+        self.assertEqual(by_name["lot_1.zip!/scan.pdf"]["extraction_status"], "skipped")
+        self.assertEqual(by_name["lot_2.zip"]["extraction_status"], "failed")
+
+    def test_previously_skipped_xlsx_member_becomes_success(self):
+        # Production: раньше .xlsx внутри ZIP записывался как skipped.
+        download_id = self.new_download_id()
+        repo.save_zip_extraction(
+            download_id, make_zip_result(skipped_members=["spec.xlsx"]), self.db_path
+        )
+
+        counts = repo.save_zip_extraction(
+            download_id,
+            make_zip_result(documents=[{"member_name": "spec.xlsx", **make_xlsx_result()}]),
+            self.db_path,
+        )
+
+        self.assertEqual(counts, {"new_count": 0, "updated_count": 1, "existing_count": 0})
+        [row] = self.extractions(download_id)
+        self.assertEqual(row["extraction_status"], "success")
+        self.assertEqual(row["row_count"], 2)
+
+    def test_xlsx_save_is_idempotent(self):
+        download_id = self.new_download_id()
+
+        first = repo.save_xlsx_extraction(download_id, make_xlsx_result(), self.db_path)
+        second = repo.save_xlsx_extraction(download_id, make_xlsx_result(), self.db_path)
+
+        self.assertEqual(first["new_count"], 1)
+        self.assertEqual(second, {"new_count": 0, "updated_count": 0, "existing_count": 1})
+        self.assertEqual(repo.count_extractions(self.db_path), 1)
+
+    def test_changed_xlsx_metric_is_an_update(self):
+        download_id = self.new_download_id()
+        repo.save_xlsx_extraction(download_id, make_xlsx_result(), self.db_path)
+
+        counts = repo.save_xlsx_extraction(
+            download_id, make_xlsx_result(row_count=99), self.db_path
+        )
+
+        self.assertEqual(counts, {"new_count": 0, "updated_count": 1, "existing_count": 0})
+        self.assertEqual(self.extractions(download_id)[0]["row_count"], 99)
+
+    def test_mixed_zip_with_xlsx_is_idempotent(self):
+        download_id = self.new_download_id()
+        result = make_zip_result(
+            documents=[
+                {"member_name": "a.docx", **make_docx_result()},
+                {"member_name": "in.zip!/b.xlsx", **make_xlsx_result()},
+            ],
+            skipped_members=["c.rar"],
+        )
+
+        first = repo.save_zip_extraction(download_id, result, self.db_path)
+        second = repo.save_zip_extraction(download_id, result, self.db_path)
+
+        self.assertEqual(first, {"new_count": 3, "updated_count": 0, "existing_count": 0})
+        self.assertEqual(second, {"new_count": 0, "updated_count": 0, "existing_count": 3})
+
+    def test_save_extraction_accepts_xlsx_metrics(self):
+        download_id = self.new_download_id()
+
+        status = repo.save_extraction(
+            download_id,
+            {
+                "member_name": "spec.xlsx", "extraction_status": "success",
+                "file_type": "xlsx", "text": "t", "char_count": 1,
+                "sheet_count": 2, "row_count": 3, "cell_count": 4,
+            },
+            self.db_path,
+        )
+
+        self.assertEqual(status, "new")
+        [row] = self.extractions(download_id)
+        self.assertEqual((row["sheet_count"], row["row_count"], row["cell_count"]), (2, 3, 4))
+
 
 class ProcessingStateTest(unittest.TestCase):
     def setUp(self):
@@ -773,6 +943,135 @@ class ProcessingStateTest(unittest.TestCase):
 
         self.assertEqual(repo.count_document_processing_candidates(self.db_path), 2)
         self.assertEqual(len(self.candidate_urls()), 2)
+
+
+class ExtractionSchemaMigrationTest(unittest.TestCase):
+    """init_db на БД, созданной до поддержки XLSX: колонки добавляются, данные сохраняются."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = Path(self._tmp.name) / "old.db"
+
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+        announcement_repository.init_db(self.db_path)
+        announcement_repository.save_announcement(make_announcement(), self.db_path)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            with conn:
+                conn.execute(repo.CREATE_DOWNLOADS_TABLE)
+                conn.execute(OLD_EXTRACTIONS_TABLE)
+                conn.execute(
+                    "INSERT INTO document_downloads (resource_url, source_kind, source_ref, "
+                    "source_url, filename, saved_path, size_bytes, sha256, downloaded_at) "
+                    "VALUES (?, 'eauction_document', 'ref', 'u', 'f.zip', 'p', 5, ?, 'now')",
+                    (RESOURCE_URL, SHA_1),
+                )
+                conn.execute(
+                    "INSERT INTO document_extractions (download_id, member_name, file_type, "
+                    "extraction_status, text, char_count, paragraph_count, table_count, "
+                    "extracted_at) VALUES (1, 'hraver.docx', 'docx', 'success', 'Текст', 5, 2, 1, "
+                    "'2026-09-01T00:00:00+00:00')"
+                )
+                conn.execute(
+                    "INSERT INTO document_extractions (download_id, member_name, "
+                    "extraction_status, extracted_at) VALUES (1, 'spec.xlsx', 'skipped', "
+                    "'2026-09-01T00:00:00+00:00')"
+                )
+
+    def columns(self):
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            return [row[1] for row in conn.execute("PRAGMA table_info(document_extractions)")]
+
+    def rows(self):
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            return [
+                dict(row) for row in conn.execute("SELECT * FROM document_extractions ORDER BY id")
+            ]
+
+    def test_old_schema_has_no_xlsx_columns(self):
+        self.assertNotIn("sheet_count", self.columns())
+
+    def test_init_db_adds_missing_columns(self):
+        repo.init_db(self.db_path)
+
+        columns = self.columns()
+        for name in ("sheet_count", "row_count", "cell_count"):
+            self.assertEqual(columns.count(name), 1)
+
+    def test_migration_preserves_existing_rows(self):
+        before = self.rows()
+
+        repo.init_db(self.db_path)
+
+        after = self.rows()
+        self.assertEqual(len(after), 2)
+        for old_row, new_row in zip(before, after):
+            for key, value in old_row.items():
+                self.assertEqual(new_row[key], value)
+            for key in ("sheet_count", "row_count", "cell_count"):
+                self.assertIsNone(new_row[key])
+
+    def test_init_db_is_idempotent_after_migration(self):
+        repo.init_db(self.db_path)
+        first = self.rows()
+        columns = self.columns()
+
+        repo.init_db(self.db_path)
+
+        self.assertEqual(self.columns(), columns)
+        self.assertEqual(self.rows(), first)
+
+    def test_read_functions_return_migrated_columns_for_old_rows(self):
+        repo.init_db(self.db_path)
+
+        rows = repo.get_extractions_for_download(1, self.db_path)
+
+        self.assertEqual(rows[0]["paragraph_count"], 2)
+        self.assertEqual(rows[0]["table_count"], 1)
+        self.assertIsNone(rows[0]["sheet_count"])
+        self.assertEqual(rows[1]["extraction_status"], "skipped")
+
+    def test_old_docx_row_is_existing_after_migration(self):
+        repo.init_db(self.db_path)
+        docx = make_docx_result("Текст", char_count=5, paragraph_count=2, table_count=1)
+
+        counts = repo.save_zip_extraction(
+            1, make_zip_result(documents=[{"member_name": "hraver.docx", **docx}]), self.db_path
+        )
+
+        self.assertEqual(counts, {"new_count": 0, "updated_count": 0, "existing_count": 1})
+
+    def test_old_skipped_xlsx_becomes_success_with_metrics(self):
+        repo.init_db(self.db_path)
+
+        counts = repo.save_zip_extraction(
+            1,
+            make_zip_result(documents=[{"member_name": "spec.xlsx", **make_xlsx_result()}]),
+            self.db_path,
+        )
+
+        self.assertEqual(counts, {"new_count": 0, "updated_count": 1, "existing_count": 0})
+        by_name = {r["member_name"]: r for r in repo.get_extractions_for_download(1, self.db_path)}
+        xlsx = by_name["spec.xlsx"]
+        self.assertEqual(xlsx["extraction_status"], "success")
+        self.assertEqual((xlsx["sheet_count"], xlsx["row_count"], xlsx["cell_count"]), (1, 2, 4))
+        self.assertEqual(by_name["hraver.docx"]["text"], "Текст")
+
+    def test_partially_migrated_schema_only_adds_missing_columns(self):
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute("ALTER TABLE document_extractions ADD COLUMN sheet_count INTEGER")
+
+        repo.init_db(self.db_path)
+
+        columns = self.columns()
+        for name in ("sheet_count", "row_count", "cell_count"):
+            self.assertEqual(columns.count(name), 1)
+        self.assertEqual(len(self.rows()), 2)
 
 
 if __name__ == "__main__":

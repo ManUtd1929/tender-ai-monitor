@@ -9,7 +9,9 @@ document_downloads — metadata скачанных файлов. Логичес�
 
 document_extractions — результат извлечения текста: по одной строке на
 (download_id, member_name). Для обычного DOCX member_name = "", для ZIP — имя member.
-Статусы: success, failed, skipped (SQL CHECK намеренно нет).
+Статусы: success, failed, skipped (SQL CHECK намеренно нет). Метрики DOCX — paragraph_count,
+table_count; метрики XLSX — sheet_count, row_count, cell_count (у чужого типа NULL).
+Для member вложенного ZIP member_name имеет вид "inner.zip!/file.xlsx".
 
 document_processing_state — итог обработки документов объявления (по одной строке на
 resource_url): success, no_supported_document или failed (SQL CHECK намеренно нет). По ней
@@ -55,8 +57,18 @@ EXTRACTION_FIELDS = (
     "char_count",
     "paragraph_count",
     "table_count",
+    "sheet_count",
+    "row_count",
+    "cell_count",
     "error_type",
     "error_message",
+)
+
+# Колонки, которых нет в БД, созданных до поддержки XLSX: добавляются в init_db.
+EXTRACTION_MIGRATION_COLUMNS = (
+    ("sheet_count", "INTEGER"),
+    ("row_count", "INTEGER"),
+    ("cell_count", "INTEGER"),
 )
 
 CREATE_DOWNLOADS_TABLE = """
@@ -89,6 +101,9 @@ CREATE TABLE IF NOT EXISTS document_extractions (
     char_count        INTEGER,
     paragraph_count   INTEGER,
     table_count       INTEGER,
+    sheet_count       INTEGER,
+    row_count         INTEGER,
+    cell_count        INTEGER,
     error_type        TEXT,
     error_message     TEXT,
     extracted_at      TEXT NOT NULL,
@@ -199,13 +214,26 @@ def _connect(db_path=None):
             yield conn
 
 
+def _add_missing_extraction_columns(conn: sqlite3.Connection) -> None:
+    """Добавляет метрики XLSX в document_extractions старой схемы; строки не изменяются."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(document_extractions)")}
+    for name, column_type in EXTRACTION_MIGRATION_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE document_extractions ADD COLUMN {name} {column_type}")
+            logger.info("Колонка добавлена в document_extractions: %s", name)
+
+
 def init_db(db_path=None) -> Path:
-    """Создаёт announcements (если нет) и таблицы документов и состояния. Данные не изменяет."""
+    """
+    Создаёт announcements (если нет) и таблицы документов и состояния; добавляет в
+    document_extractions недостающие колонки метрик XLSX. Существующие строки не изменяет.
+    """
     path = announcement_repository.init_db(db_path)
 
     with _connect(path) as conn:
         conn.execute(CREATE_DOWNLOADS_TABLE)
         conn.execute(CREATE_EXTRACTIONS_TABLE)
+        _add_missing_extraction_columns(conn)
         conn.execute(CREATE_PROCESSING_STATE_TABLE)
 
     logger.info("Таблицы документов готовы: %s", path)
@@ -365,35 +393,43 @@ def _counts(statuses: list[str]) -> dict:
     }
 
 
-def _docx_extraction(extraction_result: dict, member_name: str) -> dict:
-    return {
+def _success_extraction(extraction_result: dict, member_name: str) -> dict:
+    """Успешный результат extract_docx() / extract_xlsx(); метрики чужого типа остаются None."""
+    row = {
         "member_name": member_name,
-        "file_type": extraction_result.get("file_type"),
         "extraction_status": EXTRACTION_SUCCESS,
-        "text": extraction_result.get("text"),
-        "char_count": extraction_result.get("char_count"),
-        "paragraph_count": extraction_result.get("paragraph_count"),
-        "table_count": extraction_result.get("table_count"),
         "error_type": None,
         "error_message": None,
     }
+    for name in EXTRACTION_FIELDS:
+        if name not in row:
+            row[name] = extraction_result.get(name)
+    return row
 
 
 def save_docx_extraction(download_id: int, extraction_result: dict, db_path=None) -> dict:
     """Результат extract_docx() -> одна строка с member_name="" и статусом success."""
     with _connect(db_path) as conn:
-        status = _save_extraction(conn, download_id, _docx_extraction(extraction_result, ""))
+        status = _save_extraction(conn, download_id, _success_extraction(extraction_result, ""))
+    return _counts([status])
+
+
+def save_xlsx_extraction(download_id: int, extraction_result: dict, db_path=None) -> dict:
+    """Результат extract_xlsx() -> одна строка с member_name="" и статусом success."""
+    with _connect(db_path) as conn:
+        status = _save_extraction(conn, download_id, _success_extraction(extraction_result, ""))
     return _counts([status])
 
 
 def save_zip_extraction(download_id: int, extraction_result: dict, db_path=None) -> dict:
     """
-    Результат extract_docx_from_zip() -> строки documents (success), skipped_members
-    (skipped) и failures (failed). Весь результат сохраняется одной транзакцией:
-    при ошибке откатываются все member.
+    Результат extract_supported_from_zip() -> строки documents (success; DOCX и XLSX со
+    своими метриками; member_name вложенного ZIP вида "inner.zip!/a.xlsx"),
+    skipped_members (skipped) и failures (failed). Весь результат сохраняется одной
+    транзакцией: при ошибке откатываются все member.
     """
     rows = [
-        _docx_extraction(item, item["member_name"])
+        _success_extraction(item, item["member_name"])
         for item in extraction_result.get("documents", [])
     ]
     rows += [

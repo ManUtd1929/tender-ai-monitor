@@ -5,14 +5,19 @@
 Вход — enriched announcement (resource_url, resource_type и поля документа из
 enrichment). Три вида источников:
 
-    eauction_tender_page  -> document_url (ZIP/DOCX приглашения);
-    armeps_documents_page -> один документ из documents[] (приоритет языка RU, EN, HY);
+    eauction_tender_page  -> document_url (ZIP/DOCX/XLSX приглашения);
+    armeps_documents_page -> один документ из documents[] (приоритет языка RU, EN, HY,
+                             внутри языка формата .docx, .xlsx, .zip);
     direct_file           -> сам resource_url.
 
-Поддерживаются только .docx и .zip (внутри — DOCX). .doc, .pdf, .xml, .xls/.xlsx
-не скачиваются: для них план документа не строится. AI, PDF/.doc parser и OCR здесь
-нет. В monitor.py и enrichment pipeline модуль НЕ подключён; ничего не скачивается
-при импорте и без явного вызова функций.
+Поддерживаются только .docx, .xlsx и .zip (внутри — DOCX, XLSX и вложенные ZIP). .doc, .pdf,
+.xml, .xls, .rar не скачиваются: для них план документа не строится. AI, PDF/.doc parser и OCR здесь
+нет. Модуль вызывает monitor.py; ничего не скачивается при импорте и без явного вызова
+функций.
+
+Итог обработки объявления записывается в document_processing_state: success,
+no_supported_document (плана нет — HTTP не выполняется) или failed (исключение). По этому
+состоянию monitor решает, какие объявления обрабатывать повторно.
 
 HTTP выполняют только функции document_downloader. Их ошибки здесь не перехватываются
 на уровне одного объявления — их собирает process_enriched_announcements.
@@ -31,12 +36,18 @@ from src.parser.document_downloader import (
     download_direct_file,
     download_eauction_document,
 )
-from src.parser.document_extractor import extract_docx, extract_docx_from_zip
+from src.parser.document_extractor import (
+    extract_docx,
+    extract_supported_from_zip,
+    extract_xlsx,
+)
 
 logger = logging.getLogger(__name__)
 
+# Порядок = приоритет формата внутри одного языка ARMEPS.
 SUPPORTED_DOCUMENT_EXTENSIONS = (
     ".docx",
+    ".xlsx",
     ".zip",
 )
 
@@ -51,8 +62,9 @@ RESOURCE_TYPE_EAUCTION = "eauction_tender_page"
 RESOURCE_TYPE_ARMEPS = "armeps_documents_page"
 RESOURCE_TYPE_DIRECT_FILE = "direct_file"
 
-STATUS_SUCCESS = "success"
-STATUS_NO_SUPPORTED_DOCUMENT = "no_supported_document"
+STATUS_SUCCESS = document_repository.PROCESSING_SUCCESS
+STATUS_NO_SUPPORTED_DOCUMENT = document_repository.PROCESSING_NO_SUPPORTED_DOCUMENT
+STATUS_FAILED = document_repository.PROCESSING_FAILED
 
 
 # --------------------------------------------------------------------------
@@ -84,11 +96,23 @@ def _normalize_language(language) -> str:
     return language.strip().upper() if isinstance(language, str) else ""
 
 
+def _best_format(documents: list[dict]) -> dict:
+    """Документ с наиболее приоритетным расширением; min берёт первый из равных."""
+    return min(
+        documents,
+        key=lambda document: SUPPORTED_DOCUMENT_EXTENSIONS.index(
+            get_file_extension(document["filename"])
+        ),
+    )
+
+
 def select_armeps_document(documents: list[dict]) -> dict | None:
     """
     Выбирает один документ ARMEPS. Кандидаты: непустые document_id и filename,
     расширение из SUPPORTED_DOCUMENT_EXTENSIONS (XML и прочее не выбираются).
-    Первый по ARMEPS_LANGUAGE_PRIORITY, иначе первый подходящий в исходном порядке.
+    Язык важнее формата: сначала первый язык из ARMEPS_LANGUAGE_PRIORITY, у которого
+    есть кандидаты, иначе все кандидаты. Внутри группы побеждает формат по порядку
+    SUPPORTED_DOCUMENT_EXTENSIONS (.docx, .xlsx, .zip), при равенстве — исходный порядок.
     Список и документы не изменяются.
     """
     candidates = [
@@ -100,11 +124,14 @@ def select_armeps_document(documents: list[dict]) -> dict | None:
     ]
 
     for language in ARMEPS_LANGUAGE_PRIORITY:
-        for document in candidates:
-            if _normalize_language(document.get("language")) == language:
-                return document
+        group = [
+            document for document in candidates
+            if _normalize_language(document.get("language")) == language
+        ]
+        if group:
+            return _best_format(group)
 
-    return candidates[0] if candidates else None
+    return _best_format(candidates) if candidates else None
 
 
 def _build_plan(
@@ -200,15 +227,17 @@ def download_planned_source(plan: dict, root_dir=None) -> dict:
 
 
 def extract_downloaded_file(download_result: dict) -> dict:
-    """Извлекает текст из скачанного .docx или .zip; тип определяется по saved_path / filename."""
+    """Извлекает текст из скачанного .docx, .xlsx или .zip; тип определяется по saved_path / filename."""
     saved_path = download_result.get("saved_path")
 
     for name in (saved_path, download_result.get("filename")):
         extension = get_file_extension(name)
         if extension == ".docx":
             return {"extraction_type": "docx", "result": extract_docx(saved_path)}
+        if extension == ".xlsx":
+            return {"extraction_type": "xlsx", "result": extract_xlsx(saved_path)}
         if extension == ".zip":
-            return {"extraction_type": "zip", "result": extract_docx_from_zip(saved_path)}
+            return {"extraction_type": "zip", "result": extract_supported_from_zip(saved_path)}
 
     raise ValueError(
         f"Unsupported file for extraction: {saved_path!r} "
@@ -225,8 +254,9 @@ def process_enriched_announcement(
 ) -> dict:
     """
     План -> скачивание -> save_download -> извлечение -> save_*_extraction.
-    Без поддерживаемого документа возвращает status="no_supported_document" без HTTP
-    и без записи в БД. Ошибки downloader/extractor/repository не перехватываются.
+    Без поддерживаемого документа возвращает status="no_supported_document" без HTTP и
+    без записи download/extraction. Итог (success / no_supported_document) сохраняется в
+    document_processing_state. Ошибки downloader/extractor/repository не перехватываются.
     """
     resource_url = enriched_announcement.get("resource_url")
 
@@ -235,6 +265,9 @@ def process_enriched_announcement(
         logger.info(
             "Нет поддерживаемого документа: %s (resource_type=%s)",
             resource_url, enriched_announcement.get("resource_type"),
+        )
+        document_repository.save_processing_state(
+            resource_url, STATUS_NO_SUPPORTED_DOCUMENT, db_path=db_path,
         )
         return {
             "resource_url": resource_url,
@@ -267,10 +300,19 @@ def process_enriched_announcement(
         extraction_storage = document_repository.save_docx_extraction(
             download_id, extraction["result"], db_path=db_path,
         )
+    elif extraction_type == "xlsx":
+        extraction_storage = document_repository.save_xlsx_extraction(
+            download_id, extraction["result"], db_path=db_path,
+        )
     else:
         extraction_storage = document_repository.save_zip_extraction(
             download_id, extraction["result"], db_path=db_path,
         )
+
+    document_repository.save_processing_state(
+        plan["resource_url"], STATUS_SUCCESS,
+        source_kind=plan["source_kind"], source_ref=plan["source_ref"], db_path=db_path,
+    )
 
     logger.info(
         "Документ обработан: %s, download_id=%s (%s), extraction=%s",
@@ -288,10 +330,27 @@ def process_enriched_announcement(
     }
 
 
+def _save_failed_state(resource_url, error: Exception, db_path=None) -> None:
+    """Записывает status=failed; сбой самой записи только логируется (не прерывает цикл)."""
+    if _is_blank(resource_url):
+        return
+    try:
+        document_repository.save_processing_state(
+            resource_url, STATUS_FAILED,
+            error_type=type(error).__name__, error_message=str(error), db_path=db_path,
+        )
+    except Exception:
+        logger.exception("Не удалось сохранить состояние failed: %s", resource_url)
+
+
 def process_enriched_announcements(
     enriched_announcements: list[dict], db_path=None, root_dir=None,
 ) -> dict:
-    """Последовательно обрабатывает объявления; ошибка одного попадает в failures."""
+    """
+    Последовательно обрабатывает объявления; ошибка одного попадает в failures и
+    сохраняется как status=failed в document_processing_state. Ошибка init_db не
+    перехватывается и состояний не создаёт.
+    """
     logger.info("Запуск обработки документов: объявлений %d", len(enriched_announcements))
 
     document_repository.init_db(db_path=db_path)
@@ -319,6 +378,7 @@ def process_enriched_announcements(
                 "error_type": type(error).__name__,
                 "error_message": str(error),
             })
+            _save_failed_state(resource_url, error, db_path=db_path)
             continue
 
         results.append(result)
