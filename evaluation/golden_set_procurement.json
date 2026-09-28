@@ -1,0 +1,314 @@
+[
+  {
+    "case_id": "case-694cfed7e6c2fc7d",
+    "resource_url": "https://eauction.armeps.am/hy/public/tender_details/tmid/d903e27c-3159-45ae-be43-6f33a82068ba",
+    "input_hash": "4421bf2f5c6585fb22be7b53793d5e9ded8ccff980d657f41a7b1dc220159995",
+    "title": "ԵՔ-ԷԱՃԾՁԲ-26/148 услуги архивирования",
+    "expected": {
+      "relevance_status": "not_relevant",
+      "opportunity_type": "other_service",
+      "category": "archiving_services",
+      "expected_reason": "Предмет закупки — услуги архивирования, а не поставка физических товаров.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-016d45119de4b138",
+    "resource_url": "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12486537",
+    "input_hash": "f1b960a47f3a318ec04814006d14a7ad5e1b39cbe1ee486b2fcbe7bd1e036c96",
+    "title": "Работ по реконструкции спортивного зала старшей школы № 1 имени А. Бакунца г. Горис Сюникской области, РА",
+    "expected": {
+      "relevance_status": "not_relevant",
+      "opportunity_type": "unrelated",
+      "category": null,
+      "expected_reason": "Предмет закупки — строительные работы по реконструкции, а не поставка физических товаров.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-5b5390c92d7b8324",
+    "resource_url": "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12483827",
+    "input_hash": "ea0dbd1474cf9635b25a80a7f031f4b0357c663528d03c5dc135984eaf760356",
+    "title": "ОБЪЯВЛЕНИЕ ОБ ОТКРЫТОМ КОНКУРСЕ Шифр открытого конкурса: “МО РА-БМАПДЗБ-26-7/36”.",
+    "expected": {
+      "relevance_status": "relevant",
+      "opportunity_type": "procurement",
+      "category": "aviation_fuel",
+      "expected_reason": "Закупается физический товар — авиационное топливо, которое относится к procurement-возможностям.",
+      "notes": "Document coverage incomplete; technical and participation requirements require further review."
+    }
+  },
+  {
+    "case_id": "case-1c9d5d01e3ad7efd",
+    "resource_url": "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12486627",
+    "input_hash": "12f383e08420c248ced0b3c2270584cb7fe0d321618a84bfc1c1052d4f8195df",
+    "title": "Закупка товаров для нужд общины Аракс в Армавирской области Республики Армения",
+    "expected": {
+      "relevance_status": "relevant",
+      "opportunity_type": "procurement",
+      "category": "infrastructure_goods",
+      "expected_reason": "Закупаются физические товары: элементы инфраструктуры, включая чугунные крышки и железобетонные элементы колодцев.",
+      "notes": "Document coverage incomplete."
+    }
+  },
+  {
+    "case_id": "case-9189e884d91d595b",
+    "resource_url": "https://eauction.armeps.am/hy/public/tender_details/tmid/d3c2b3b6-58f4-4d02-8ae2-1eb2e6b584dc",
+    "input_hash": "e34e44200443686cc4e9e569f08a87873219909bc1ed4f866b7d287edeb3bb05",
+    "title": "Закупка питьевой воды для нужд Гюмрийского филиала фонда «Национальный политехнический университет Армении»",
+    "expected": {
+      "relevance_status": "relevant",
+      "opportunity_type": "procurement",
+      "category": "drinking_water",
+      "expected_reason": "Закупается физический товар — питьевая вода.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-43e7fffc7ff716e3",
+    "resource_url": "https://eauction.armeps.am/hy/public/tender_details/tmid/7b50eaca-8298-4cb0-8847-cb45ca8318fb",
+    "input_hash": "16ce4b966ebe5959a0f56b661d85a32f4a461f1e25b1ad232a13f93fc3aea163",
+    "title": "Приобретение медикаментов и лабораторных материалов для нужд ЗАО «Севанский медицинский центр».",
+    "expected": {
+      "relevance_status": "relevant",
+      "opportunity_type": "procurement",
+      "category": "pharmaceuticals_and_lab_supplies",
+      "expected_reason": "Закупаются физические товары — медикаменты и лабораторные материалы.",
+      "notes": "Potential regulatory, certification or medical-product participation barriers must be evaluated separately from relevance."
+    }
+  },
+  {
+    "case_id": "case-a8cda06ae8c49334",
+    "resource_url": "https://eauction.armeps.am/hy/public/tender_details/tmid/35c169e2-24c3-414d-bc7b-a026da67efd6",
+    "input_hash": "e636084d5dd1a1f9915f59933005466555b474cac84d2f47bc28ab272c9baabe",
+    "title": "Химические и лабораторные материалы",
+    "expected": {
+      "relevance_status": "relevant",
+      "opportunity_type": "procurement",
+      "category": "laboratory_supplies",
+      "expected_reason": "Закупаются физические химические и лабораторные материалы.",
+      "notes": "Document coverage is incomplete because many lot specifications are unsupported legacy .doc files."
+    }
+  },
+  {
+    "case_id": "case-119b5668646a58ec",
+    "resource_url": "https://eauction.armeps.am/hy/public/tender_details/tmid/011caef1-ad01-4693-bf09-abaf40d76ebc",
+    "input_hash": "c340f9eae3bc3ce61e7ba45328633f9bc9539556e035ff2e46ef42b92c6dceae",
+    "title": "Приобретение компьютерного оборудования для нужд общины Масис Араратской области Республики Армения в 2026 году 26/98",
+    "expected": {
+      "relevance_status": "relevant",
+      "opportunity_type": "procurement",
+      "category": "computer_equipment",
+      "expected_reason": "Закупается физическое компьютерное оборудование.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-43670738adb7ac08",
+    "resource_url": "https://eauction.armeps.am/hy/public/tender_details/tmid/1ca0f0ad-dbbe-4f0a-a8df-a795cce563b4",
+    "input_hash": "11a1fdbe530a31ccd5c9bbe334f3d242815e4874096d9e2dd464ee74560af7bb",
+    "title": "Электронный аукцион № «SHMMAK-EAChAPDZB-26/17», объявленный в целях приобретения медицинское оборудование для нужд ЗАО «Мараликский центр здоровья»",
+    "expected": {
+      "relevance_status": "relevant",
+      "opportunity_type": "procurement",
+      "category": "medical_equipment",
+      "expected_reason": "Закупается физическое медицинское оборудование.",
+      "notes": "Potential registration, certification, manufacturer authorization or service requirements must be evaluated separately from relevance."
+    }
+  },
+  {
+    "case_id": "case-1789f9293f1c7b05",
+    "resource_url": "https://gnumner.minfin.am/website/images/original/2.2  _26-5-.docx",
+    "input_hash": "d4e2f13f80de30c8636b734af38890a5b235b2c2c2dff12a61828f2c083c2758",
+    "title": "Приобретение модульных и мобильных зданий для нужд службы национальной безопасности РА",
+    "expected": {
+      "relevance_status": "relevant",
+      "opportunity_type": "procurement",
+      "category": "modular_buildings",
+      "expected_reason": "Предмет процедуры — поставка физических модульных и мобильных зданий.",
+      "notes": "The documents contain qualification requirements related to prior similar supplies."
+    }
+  },
+  {
+    "case_id": "case-7e57fcaf39c956fa",
+    "resource_url": "https://gnumner.minfin.am/website/images/original/f912561d.docx",
+    "input_hash": "f0d70cd79e33f66afc100dd336cd75ee73cd6d04e8911747aa0235fe9866c42d",
+    "title": "Поставка шин  для  ОНО «Памбак Комунал»",
+    "expected": {
+      "relevance_status": "relevant",
+      "opportunity_type": "procurement",
+      "category": "tires",
+      "expected_reason": "Закупаются физические товары — автомобильные и специальные шины.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-b7b073d9dc140f75",
+    "resource_url": "https://gnumner.minfin.am/website/images/original/b03d192a.docx",
+    "input_hash": "f5d6daf36d6e6ebd64573dc3b53664b4d54a31d2c3880ab472ae999343a17a32",
+    "title": "Приглашение под кодом ՎԱՍՊ-ԳՀԱՊՁԲ-26/07",
+    "expected": {
+      "relevance_status": "relevant",
+      "opportunity_type": "procurement",
+      "category": "household_goods",
+      "expected_reason": "Закупаются физические хозяйственные товары.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-47646d4668407d68",
+    "resource_url": "https://eauction.armeps.am/hy/public/tender_details/tmid/6f6ca573-e5b3-4cd8-a154-9efe08593fea",
+    "input_hash": "817ccef1e8eae7f5ad9c8aaa3451dc7dea04a2d6f2238cfc53be7eb81f9c241a",
+    "title": "Закупка жалюзи для нужд общины Масис (Араратская область, Республика Армения) на 2026 год.",
+    "expected": {
+      "relevance_status": "relevant",
+      "opportunity_type": "procurement",
+      "category": "blinds",
+      "expected_reason": "Закупается физический товар — жалюзи.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-becaf6f0278a64c3",
+    "resource_url": "https://eauction.armeps.am/hy/public/tender_details/tmid/c01527af-ba25-460d-bf29-2abca68c5f6e",
+    "input_hash": "108a44e066b4508f2833b0fe8942354b6041c7154d14ba23bfefedf8b38eee22",
+    "title": "Закупка декоративных деревьев для нужд общины Масис (Араратская область, Республика Армения) на 2026 год",
+    "expected": {
+      "relevance_status": "relevant",
+      "opportunity_type": "procurement",
+      "category": "plants",
+      "expected_reason": "Закупаются физические товары — декоративные деревья.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-646d9e9c50f9b976",
+    "resource_url": "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12486673",
+    "input_hash": "04b97a4049a319eb041845bb54d68de95d147f05f5edf1ee43f2d9602194273e",
+    "title": "Объявление и приглашение к участию в процедуре, организованной муниципалитетом Гарни Котайкской области Республики Армения, с целью приобретения услуг технического контроля.",
+    "expected": {
+      "relevance_status": "not_relevant",
+      "opportunity_type": "other_service",
+      "category": "technical_supervision",
+      "expected_reason": "Предмет закупки — услуги технического надзора, а не поставка физических товаров.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-112e9c3834f719b5",
+    "resource_url": "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12487379",
+    "input_hash": "799cbb044d4136e67c04c128692b6903d27e4f1e2e7b66b65bbe7570d4a9cabb",
+    "title": "Закупка услуг по техническому надзору за строительством игровой комнаты, внутренней отделкой и ремонтом крыши первого этажа здания детского сада в поселке Шног, община Алаверди.",
+    "expected": {
+      "relevance_status": "not_relevant",
+      "opportunity_type": "other_service",
+      "category": "technical_supervision",
+      "expected_reason": "Предмет закупки — услуги технического надзора за строительными работами.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-786ad8b2697df402",
+    "resource_url": "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12488030",
+    "input_hash": "809083fdc519d992d2e70acaf74d2f01cc65405f4f3309898ca147068fa030c4",
+    "title": "Закупка услуг по подготовке проектной и сметной документации для работ по газификации, необходимых для нужд общины Алаверди, и предоставление гарантийного сертификата.",
+    "expected": {
+      "relevance_status": "not_relevant",
+      "opportunity_type": "other_service",
+      "category": "design_and_cost_estimation",
+      "expected_reason": "Предмет закупки — подготовка проектно-сметной документации, а не поставка физических товаров.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-8f4a40c3df4fd59c",
+    "resource_url": "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12484779",
+    "input_hash": "f02f82808b80e44f9abda3e2e942293cdc031f65f6c907a7afdf72d31359790c",
+    "title": "Закупка консультационных услуг по разработке проектно-сметной документации для нужд администрации общины Паракар Армавирской области Республики Армения по процедуре с кодом АМПХ-ХБМЦДЗБ-63/26",
+    "expected": {
+      "relevance_status": "not_relevant",
+      "opportunity_type": "other_service",
+      "category": "design_and_cost_estimation",
+      "expected_reason": "Предмет закупки — консультационные и проектно-сметные услуги.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-8bac711407b1e38d",
+    "resource_url": "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12489257",
+    "input_hash": "b2d2244093c8f358046af4957fdade48f38abcbc57da7d1bc4009f33111e7741",
+    "title": "Закупка услуг по проведению экспертизы проектно-сметной документации для нужд ЗАО «Высоковольтные электрические сети».",
+    "expected": {
+      "relevance_status": "not_relevant",
+      "opportunity_type": "other_service",
+      "category": "expertise_services",
+      "expected_reason": "Предмет закупки — экспертиза проектно-сметной документации.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-e8aeb5c3ae47850b",
+    "resource_url": "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12485004",
+    "input_hash": "12bce502ac0099a50d914b2ed9e122e4b7e3892bb2ed8c17634070eac97fb6a4",
+    "title": "ОБЪЯВЛЕНИЕ ОБ ОТКРЫТОМ КОНКУРСЕ Шифр открытого конкурса: “МО РА-БМЦДзБ-26-33/1”.",
+    "expected": {
+      "relevance_status": "not_relevant",
+      "opportunity_type": "other_service",
+      "category": "sports_event_services",
+      "expected_reason": "Предмет закупки — услуги по организации спортивных мероприятий.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-c9ed4767b87d1ec1",
+    "resource_url": "https://eauction.armeps.am/hy/public/tender_details/tmid/0d61e134-480c-40a6-a913-e7759e8a89c8",
+    "input_hash": "47640f180ddf5c8f536d29de062fa574789ea1c09b769625f148204031095ec0",
+    "title": "ЭЛЕКТРОННЫЙ АУКЦИОН",
+    "expected": {
+      "relevance_status": "not_relevant",
+      "opportunity_type": "other_service",
+      "category": "software_license",
+      "expected_reason": "Предмет закупки — программная лицензия/информационная система, а не физический товар.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-1868ef900c72d0cc",
+    "resource_url": "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12487340",
+    "input_hash": "6af3f74bb644140ce32a27cc738464fc9f8536cb5596588fec31083afbe6fd40",
+    "title": "Закупка работ по строительству игровой комнаты для внутренней отделки и ремонту крыши первого этажа здания детского сада в поселке Шног, община Алаверди.",
+    "expected": {
+      "relevance_status": "not_relevant",
+      "opportunity_type": "unrelated",
+      "category": null,
+      "expected_reason": "Предмет закупки — строительные и ремонтные работы.",
+      "notes": "Available sources contain conflicting descriptions of the specific construction work; the high-level conclusion remains not_relevant."
+    }
+  },
+  {
+    "case_id": "case-ce6ea401dfdf8ad5",
+    "resource_url": "https://armeps.am/epps/cft/listContractDocuments.do?resourceId=12489063",
+    "input_hash": "eac44f5a2c6870a2a399d9fd916c5fbb5bfb2e03186c269860df169fd9ca8d40",
+    "title": "Строительство дренажной системы улиц Угекалнери и Г.Чауш в селе Джраррат общины Аракс Армавирской области Республики Армения.",
+    "expected": {
+      "relevance_status": "not_relevant",
+      "opportunity_type": "unrelated",
+      "category": null,
+      "expected_reason": "Предмет закупки — строительные работы по устройству инфраструктуры.",
+      "notes": null
+    }
+  },
+  {
+    "case_id": "case-6938801aa69d446c",
+    "resource_url": "https://gnumner.minfin.am/website/images/original/ce6fd266.doc",
+    "input_hash": "5041da9db4ec1eea5833387c44f5e48e4a50cc57d19c29718851d063826a5d91",
+    "title": "О ПРОЦЕДУРЕ КВАЛИФИКАЦИИ: Код процедуры: \"RA CPC-PGHAPDB-26/5\"",
+    "expected": {
+      "relevance_status": "maybe",
+      "opportunity_type": "unclear",
+      "category": null,
+      "expected_reason": "Доступных данных недостаточно, чтобы надёжно определить предмет и тип закупки.",
+      "notes": "Requires manual review or additional source documents."
+    }
+  }
+]
