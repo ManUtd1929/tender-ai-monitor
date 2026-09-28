@@ -3,3 +3,5 @@ beautifulsoup4
 truststore
 python-docx
 openpyxl
+openai
+python-dotenv
