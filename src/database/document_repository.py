@@ -17,6 +17,11 @@ document_processing_state — итог обработки документов �
 resource_url): success, no_supported_document или failed (SQL CHECK намеренно нет). По ней
 get_document_processing_candidates решает, какие объявления ещё нужно обработать.
 
+replace_extractions_for_download — authoritative snapshot extraction одного (неизменяемого по
+sha256) download: сохраняет текущие строки и удаляет устаревшие одной транзакцией; её использует
+локальный backfill. get_document_extraction_backfill_candidates выбирает download, extraction
+которых нужно пересчитать (открывает БД только на чтение).
+
 Таблица announcements здесь только читается (проверка resource_url); её схема
 и данные не изменяются. Общий у модулей только файл БД. Запросы кандидатов читают также
 announcement_enrichment и enrichment_processing_state, поэтому перед ними должен быть
@@ -31,6 +36,7 @@ from pathlib import Path
 
 from src.database import announcement_repository, enrichment_repository
 from src.database.tender_repository import DEFAULT_DB_PATH
+from src.parser.document_extractor import DEFAULT_MAX_NESTED_DEPTH
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +250,14 @@ def _is_blank(value) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 
 
+def _validate_limit(limit) -> None:
+    """limit — None или положительное целое (bool — подкласс int, но это почти наверняка ошибка)."""
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
+    ):
+        raise ValueError(f"limit должен быть положительным целым или None: {limit!r}")
+
+
 # --- downloads ---
 
 def _save_download(
@@ -421,13 +435,8 @@ def save_xlsx_extraction(download_id: int, extraction_result: dict, db_path=None
     return _counts([status])
 
 
-def save_zip_extraction(download_id: int, extraction_result: dict, db_path=None) -> dict:
-    """
-    Результат extract_supported_from_zip() -> строки documents (success; DOCX и XLSX со
-    своими метриками; member_name вложенного ZIP вида "inner.zip!/a.xlsx"),
-    skipped_members (skipped) и failures (failed). Весь результат сохраняется одной
-    транзакцией: при ошибке откатываются все member.
-    """
+def _zip_extraction_rows(extraction_result: dict) -> list[dict]:
+    """Результат extract_supported_from_zip() -> строки success, затем skipped, затем failed."""
     rows = [
         _success_extraction(item, item["member_name"])
         for item in extraction_result.get("documents", [])
@@ -448,6 +457,78 @@ def save_zip_extraction(download_id: int, extraction_result: dict, db_path=None)
         }
         for item in extraction_result.get("failures", [])
     ]
+    return rows
+
+
+def build_extraction_records(extraction_type: str, extraction_result: dict) -> list[dict]:
+    """
+    Результат extract_docx / extract_xlsx / extract_supported_from_zip -> список строк
+    extraction (success / skipped / failed) с метриками. extraction_type: "docx", "xlsx", "zip".
+    Обычный документ — одна строка с member_name="", ZIP — по строке на member (member_name
+    вложенного ZIP вида "outer.zip!/inner.xlsx"). ValueError — неизвестный extraction_type.
+    """
+    if extraction_type in ("docx", "xlsx"):
+        return [_success_extraction(extraction_result, "")]
+    if extraction_type == "zip":
+        return _zip_extraction_rows(extraction_result)
+    raise ValueError(f"Неизвестный extraction_type: {extraction_type!r}")
+
+
+def replace_extractions_for_download(
+    download_id: int, extraction_records: list[dict], db_path=None
+) -> dict:
+    """
+    Authoritative snapshot extraction для download_id: сохраняет все extraction_records
+    (как save_extraction: new / updated / existing) и удаляет строки этого download, которых
+    в snapshot нет (например, прежний skipped "lot_1.zip", вместо которого теперь
+    "lot_1.zip!/spec.xlsx"). Одна транзакция: при любой ошибке откатывается всё. Безопасно,
+    потому что download неизменяем по sha256; document_downloads не изменяется. Пустой список
+    удаляет все extraction этого download. ValueError — download_id не существует или у
+    записи нет extraction_status.
+    Возвращает {"new_count", "updated_count", "existing_count", "deleted_count"}.
+    """
+    with _connect(db_path) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM document_downloads WHERE id = ?", (download_id,)
+        ).fetchone()
+        if exists is None:
+            raise ValueError(f"Скачанный документ не найден в document_downloads: {download_id}")
+
+        statuses = [_save_extraction(conn, download_id, record) for record in extraction_records]
+        kept = {record.get("member_name") or "" for record in extraction_records}
+
+        obsolete = [
+            (row_id, member_name)
+            for row_id, member_name in conn.execute(
+                "SELECT id, member_name FROM document_extractions WHERE download_id = ?",
+                (download_id,),
+            ).fetchall()
+            if member_name not in kept
+        ]
+        for row_id, member_name in obsolete:
+            conn.execute("DELETE FROM document_extractions WHERE id = ?", (row_id,))
+            logger.info(
+                "Устаревший extraction удалён: download_id=%d member=%r", download_id, member_name
+            )
+
+    counts = {**_counts(statuses), "deleted_count": len(obsolete)}
+    logger.info(
+        "Extraction snapshot сохранён (download_id=%d): записей %d, новых %d, обновлённых %d, "
+        "без изменений %d, удалено %d",
+        download_id, len(extraction_records), counts["new_count"], counts["updated_count"],
+        counts["existing_count"], counts["deleted_count"],
+    )
+    return counts
+
+
+def save_zip_extraction(download_id: int, extraction_result: dict, db_path=None) -> dict:
+    """
+    Результат extract_supported_from_zip() -> строки documents (success; DOCX и XLSX со
+    своими метриками; member_name вложенного ZIP вида "inner.zip!/a.xlsx"),
+    skipped_members (skipped) и failures (failed). Весь результат сохраняется одной
+    транзакцией: при ошибке откатываются все member.
+    """
+    rows = _zip_extraction_rows(extraction_result)
 
     with _connect(db_path) as conn:
         statuses = [_save_extraction(conn, download_id, row) for row in rows]
@@ -517,12 +598,10 @@ def get_document_processing_candidates(db_path=None, limit: int | None = None) -
     то есть готов для document_pipeline.process_enriched_announcement.
     limit=None — все; limit — положительное целое, иначе ValueError.
     """
+    _validate_limit(limit)
     query = SELECT_PROCESSING_CANDIDATE_URLS
     params: tuple = ()
     if limit is not None:
-        # bool — подкласс int, но True/False как лимит — почти наверняка ошибка.
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
-            raise ValueError(f"limit должен быть положительным целым или None: {limit!r}")
         query += " LIMIT ?"
         params = (limit,)
 
@@ -542,6 +621,105 @@ def get_document_processing_candidates(db_path=None, limit: int | None = None) -
 def count_document_processing_candidates(db_path=None) -> int:
     with _connect(db_path) as conn:
         return conn.execute(COUNT_PROCESSING_CANDIDATES).fetchone()[0]
+
+
+# --- кандидаты backfill extraction ---
+
+BACKFILL_REASON_NO_EXTRACTION = "no_extraction"
+BACKFILL_REASON_FAILED_EXTRACTION = "failed_extraction"
+BACKFILL_REASON_SKIPPED_SUPPORTED = "skipped_supported_members"
+
+NESTED_MEMBER_DELIMITER = "!/"
+
+SELECT_BACKFILL_DOWNLOADS = """
+SELECT
+    document_downloads.id AS id,
+    document_downloads.resource_url AS resource_url,
+    document_downloads.source_kind AS source_kind,
+    document_downloads.source_ref AS source_ref,
+    document_downloads.filename AS filename,
+    document_downloads.saved_path AS saved_path,
+    document_downloads.sha256 AS sha256,
+    document_downloads.downloaded_at AS downloaded_at,
+    (SELECT COUNT(*) FROM document_extractions
+        WHERE document_extractions.download_id = document_downloads.id) AS extraction_count,
+    (SELECT COUNT(*) FROM document_extractions
+        WHERE document_extractions.download_id = document_downloads.id
+            AND document_extractions.extraction_status = 'failed') AS failed_extraction_count
+FROM document_downloads
+ORDER BY document_downloads.id ASC
+"""
+
+SELECT_SKIPPED_MEMBERS = (
+    "SELECT download_id, member_name FROM document_extractions "
+    "WHERE extraction_status = 'skipped' ORDER BY id ASC"
+)
+
+
+@contextmanager
+def _connect_read_only(db_path=None):
+    """Соединение mode=ro: записать через него нельзя; несуществующая БД не создаётся."""
+    path = _resolve_path(db_path).resolve()
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as conn:
+        yield conn
+
+
+def _is_supported_skipped_member(member_name: str) -> bool:
+    """
+    Skipped member, который текущий extractor уже обрабатывает: любой .xlsx и .zip не глубже
+    предела вложенности. Прежний extractor пропускал все .xlsx и .zip; .doc, .pdf, .rar, .xml
+    по-прежнему не поддерживаются, поэтому причиной backfill не являются. ZIP на предельной
+    глубине ("a.zip!/b.zip" при глубине 2) skipped и сейчас: он не должен делать download
+    кандидатом навсегда.
+    """
+    lowered = member_name.lower()
+    if lowered.endswith(".xlsx"):
+        return True
+    if lowered.endswith(".zip"):
+        level = lowered.count(NESTED_MEMBER_DELIMITER) + 1
+        return level < DEFAULT_MAX_NESTED_DEPTH
+    return False
+
+
+def get_document_extraction_backfill_candidates(db_path=None, limit: int | None = None) -> list[dict]:
+    """
+    Скачанные документы, extraction которых нужно пересчитать локально (id по возрастанию):
+      - нет ни одной extraction (reason "no_extraction");
+      - есть extraction_status = "failed" ("failed_extraction");
+      - есть skipped member .xlsx или .zip, которые теперь поддерживаются
+        ("skipped_supported_members").
+    Каждый dict: id, resource_url, source_kind, source_ref, filename, saved_path, sha256,
+    downloaded_at, extraction_count, failed_extraction_count, skipped_supported_count,
+    reasons (список причин). БД открывается только на чтение; ничего не изменяется.
+    limit=None — все; limit — положительное целое, иначе ValueError.
+    """
+    _validate_limit(limit)
+
+    with _connect_read_only(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        downloads = [dict(row) for row in conn.execute(SELECT_BACKFILL_DOWNLOADS).fetchall()]
+        skipped = conn.execute(SELECT_SKIPPED_MEMBERS).fetchall()
+
+    skipped_supported: dict[int, int] = {}
+    for download_id, member_name in skipped:
+        if _is_supported_skipped_member(member_name):
+            skipped_supported[download_id] = skipped_supported.get(download_id, 0) + 1
+
+    candidates = []
+    for download in downloads:
+        download["skipped_supported_count"] = skipped_supported.get(download["id"], 0)
+        reasons = []
+        if download["extraction_count"] == 0:
+            reasons.append(BACKFILL_REASON_NO_EXTRACTION)
+        if download["failed_extraction_count"] > 0:
+            reasons.append(BACKFILL_REASON_FAILED_EXTRACTION)
+        if download["skipped_supported_count"] > 0:
+            reasons.append(BACKFILL_REASON_SKIPPED_SUPPORTED)
+        if reasons:
+            download["reasons"] = reasons
+            candidates.append(download)
+
+    return candidates if limit is None else candidates[:limit]
 
 
 # --- чтение ---
