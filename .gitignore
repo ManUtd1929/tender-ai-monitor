@@ -11,3 +11,4 @@ logs/
 
 # Артефакты запусков AI evaluation (golden_set_procurement.json остаётся tracked)
 evaluation/runs/
+evaluation/deep_runs/

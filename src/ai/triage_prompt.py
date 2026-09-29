@@ -177,8 +177,31 @@ SYSTEM_PROMPT = _SYSTEM_PROMPT_TEMPLATE.format(
     document_field=evidence_grounding.DOCUMENT_EVIDENCE_FIELD,
 )
 
-_STRING_OR_NULL =["string", "null"]
-_INTEGER_OR_NULL = ["integer", "null"]
+STRING_OR_NULL = ["string", "null"]
+INTEGER_OR_NULL = ["integer", "null"]
+# Обратная совместимость (были private-именами модуля до вынесения build_evidence_item_schema).
+_STRING_OR_NULL = STRING_OR_NULL
+_INTEGER_OR_NULL = INTEGER_OR_NULL
+
+
+def build_evidence_item_schema() -> dict:
+    """
+    Strict JSON schema для одного evidence item (relevance_schema.EVIDENCE_FIELDS/
+    EVIDENCE_SOURCE_TYPES). Общий для triage и deep analysis (src.ai.deep_prompt), чтобы не
+    дублировать structured-output схему evidence в двух местах. Каждый вызов — новый dict.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "source_type": {"type": "string", "enum": list(relevance_schema.EVIDENCE_SOURCE_TYPES)},
+            "field": {"type": STRING_OR_NULL},
+            "download_id": {"type": INTEGER_OR_NULL},
+            "member_name": {"type": STRING_OR_NULL},
+            "text": {"type": "string"},
+        },
+        "required": list(relevance_schema.EVIDENCE_FIELDS),
+        "additionalProperties": False,
+    }
 
 
 def build_triage_output_schema() -> dict:
@@ -189,18 +212,7 @@ def build_triage_output_schema() -> dict:
     может (комбинации полей, snake_case category, grounding evidence), проверяются
     application validation в src.ai.openai_triage.
     """
-    evidence_item = {
-        "type": "object",
-        "properties": {
-            "source_type": {"type": "string", "enum": list(relevance_schema.EVIDENCE_SOURCE_TYPES)},
-            "field": {"type": _STRING_OR_NULL},
-            "download_id": {"type": _INTEGER_OR_NULL},
-            "member_name": {"type": _STRING_OR_NULL},
-            "text": {"type": "string"},
-        },
-        "required": list(relevance_schema.EVIDENCE_FIELDS),
-        "additionalProperties": False,
-    }
+    evidence_item = build_evidence_item_schema()
     properties = {
         "relevance_status": {"type": "string", "enum": list(relevance_schema.RELEVANCE_STATUSES)},
         "opportunity_type": {"type": "string", "enum": list(MVP_OPPORTUNITY_TYPES)},

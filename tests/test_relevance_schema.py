@@ -39,6 +39,8 @@ def make_triage(**overrides) -> dict:
 
 def make_procurement_block(**overrides) -> dict:
     block = {name: None for name in schema.PROCUREMENT_SCALAR_FIELDS}
+    for name in schema.PROCUREMENT_OBJECT_FIELDS:
+        block[name] = None
     for name in schema.PROCUREMENT_LIST_FIELDS:
         block[name] = []
     block["subject"] = "Поставка компьютерной техники"
@@ -53,14 +55,63 @@ def make_logistics_block(**overrides) -> dict:
     return block
 
 
+def make_procurement_item(**overrides) -> dict:
+    item = {
+        "item_name": "Ноутбук",
+        "lot_number": None,
+        "quantity": "10",
+        "unit": "шт.",
+        "key_specifications": [],
+        "evidence": [make_evidence()],
+    }
+    item.update(overrides)
+    return item
+
+
+def make_procurement_lot(**overrides) -> dict:
+    lot = {
+        "lot_number": "1",
+        "description": None,
+        "item_count": None,
+        "evidence": [],
+    }
+    lot.update(overrides)
+    return lot
+
+
+def make_barrier(**overrides) -> dict:
+    barrier = {
+        "type": "official_dealer_required",
+        "description": "Требуется официальный дилер производителя",
+        "severity": "medium",
+        "evidence": [make_evidence()],
+    }
+    barrier.update(overrides)
+    return barrier
+
+
+def make_source_conflict(**overrides) -> dict:
+    conflict = {
+        "sources": ["announcement", "document"],
+        "conflict_description": "Announcement описывает поставку мебели, документ — строительные работы",
+        "impact": "Невозможно однозначно определить предмет закупки",
+    }
+    conflict.update(overrides)
+    return conflict
+
+
 def make_deep_result(opportunity_type="logistics", **overrides) -> dict:
     result = {
         "summary": "Тендер на международную перевозку груза",
         "opportunity_type": opportunity_type,
         "category": "international_freight",
         "why_interesting": "Логистическая услуга, релевантно CIO",
+        "contracting_authority": "Министерство обороны",
+        "procedure_code": "ATCPO-2025-0001",
+        "confidence": "high",
         "participation_barriers": [],
         "missing_information": [],
+        "source_conflicts": [],
         "manual_review_required": False,
         "evidence": [make_evidence()],
         "procurement": None,
@@ -260,10 +311,10 @@ class TriageValidationTests(unittest.TestCase):
 
 class ProcurementBlockTests(unittest.TestCase):
     def test_valid_block_round_trips(self):
-        block = make_procurement_block(items=[{"name": "Laptop", "quantity": "10"}])
+        block = make_procurement_block(items=[make_procurement_item()])
         validated = schema.validate_procurement_block(block)
         self.assertEqual(validated["subject"], "Поставка компьютерной техники")
-        self.assertEqual(validated["items"], [{"name": "Laptop", "quantity": "10"}])
+        self.assertEqual(validated["items"], [make_procurement_item()])
 
     def test_unknown_key_rejected(self):
         block = make_procurement_block()
@@ -289,6 +340,63 @@ class ProcurementBlockTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             schema.validate_procurement_block(make_procurement_block(subject=123))
 
+    def test_total_lots_accepts_nonneg_int_or_none(self):
+        validated = schema.validate_procurement_block(make_procurement_block(total_lots=57))
+        self.assertEqual(validated["total_lots"], 57)
+        validated = schema.validate_procurement_block(make_procurement_block(total_lots=None))
+        self.assertIsNone(validated["total_lots"])
+
+    def test_negative_total_lots_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_procurement_block(make_procurement_block(total_lots=-1))
+
+    def test_brand_or_equivalent_none_allowed(self):
+        validated = schema.validate_procurement_block(make_procurement_block(brand_or_equivalent=None))
+        self.assertIsNone(validated["brand_or_equivalent"])
+
+    def test_brand_or_equivalent_known_brand_unknown_equivalent(self):
+        validated = schema.validate_procurement_block(make_procurement_block(
+            brand_or_equivalent={"specified_brand": "Toyota Hilux", "equivalent_allowed": None},
+        ))
+        self.assertEqual(validated["brand_or_equivalent"], {
+            "specified_brand": "Toyota Hilux", "equivalent_allowed": None,
+        })
+
+    def test_brand_or_equivalent_bad_shape_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_procurement_block(make_procurement_block(brand_or_equivalent="Toyota"))
+
+    def test_item_without_evidence_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_procurement_block(make_procurement_block(
+                items=[make_procurement_item(evidence=[])],
+            ))
+
+    def test_item_without_name_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_procurement_block(make_procurement_block(
+                items=[make_procurement_item(item_name=None)],
+            ))
+
+    def test_item_missing_quantity_stays_null(self):
+        validated = schema.validate_procurement_block(make_procurement_block(
+            items=[make_procurement_item(quantity=None, unit=None)],
+        ))
+        self.assertIsNone(validated["items"][0]["quantity"])
+        self.assertIsNone(validated["items"][0]["unit"])
+
+    def test_lot_summary_round_trips_without_evidence(self):
+        validated = schema.validate_procurement_block(make_procurement_block(
+            lots=[make_procurement_lot(item_count=12)],
+        ))
+        self.assertEqual(validated["lots"][0]["item_count"], 12)
+
+    def test_lot_without_number_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_procurement_block(make_procurement_block(
+                lots=[make_procurement_lot(lot_number=None)],
+            ))
+
 
 class LogisticsBlockTests(unittest.TestCase):
     def test_valid_block_round_trips(self):
@@ -309,17 +417,73 @@ class LogisticsBlockTests(unittest.TestCase):
 
 
 class ParticipationBarrierTests(unittest.TestCase):
-    def test_known_barriers_accepted(self):
-        validated = schema.validate_participation_barriers(list(schema.PARTICIPATION_BARRIER_TYPES))
-        self.assertEqual(validated, list(schema.PARTICIPATION_BARRIER_TYPES))
+    def test_known_barrier_types_accepted(self):
+        for barrier_type in schema.PARTICIPATION_BARRIER_TYPES:
+            with self.subTest(barrier_type=barrier_type):
+                validated = schema.validate_participation_barriers([make_barrier(type=barrier_type)])
+                self.assertEqual(validated[0]["type"], barrier_type)
 
-    def test_unknown_barrier_rejected(self):
+    def test_unknown_barrier_type_rejected(self):
         with self.assertRaises(ValueError):
-            schema.validate_participation_barriers(["needs_a_helicopter"])
+            schema.validate_participation_barriers([make_barrier(type="needs_a_helicopter")])
 
     def test_not_a_list_rejected(self):
         with self.assertRaises(ValueError):
             schema.validate_participation_barriers("certification")
+
+    def test_not_a_dict_item_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_participation_barriers(["certification"])
+
+    def test_blank_description_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_participation_barriers([make_barrier(description="")])
+
+    def test_unknown_severity_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_participation_barriers([make_barrier(severity="critical")])
+
+    def test_empty_evidence_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_participation_barriers([make_barrier(evidence=[])])
+
+    def test_unknown_key_rejected(self):
+        barrier = make_barrier()
+        barrier["extra"] = "x"
+        with self.assertRaises(ValueError):
+            schema.validate_participation_barriers([barrier])
+
+    def test_missing_key_rejected(self):
+        barrier = make_barrier()
+        del barrier["severity"]
+        with self.assertRaises(ValueError):
+            schema.validate_participation_barriers([barrier])
+
+
+class SourceConflictTests(unittest.TestCase):
+    def test_valid_conflict_round_trips(self):
+        validated = schema.validate_source_conflicts([make_source_conflict()])
+        self.assertEqual(validated, [make_source_conflict()])
+
+    def test_not_a_list_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_source_conflicts(make_source_conflict())
+
+    def test_empty_sources_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_source_conflicts([make_source_conflict(sources=[])])
+
+    def test_unknown_source_type_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_source_conflicts([make_source_conflict(sources=["webpage"])])
+
+    def test_blank_conflict_description_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_source_conflicts([make_source_conflict(conflict_description="")])
+
+    def test_blank_impact_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_source_conflicts([make_source_conflict(impact="  ")])
 
 
 class DeepAnalysisValidationTests(unittest.TestCase):
@@ -419,14 +583,38 @@ class DeepAnalysisValidationTests(unittest.TestCase):
     def test_unknown_participation_barrier_rejected(self):
         with self.assertRaises(ValueError):
             schema.validate_deep_analysis_result(
-                make_deep_result("logistics", participation_barriers=["needs_a_wizard"])
+                make_deep_result("logistics", participation_barriers=[make_barrier(type="needs_a_wizard")])
             )
 
     def test_known_participation_barriers_accepted(self):
+        barriers = [make_barrier(type="official_dealer_required"), make_barrier(type="certification")]
         validated = schema.validate_deep_analysis_result(make_deep_result(
-            "procurement", participation_barriers=["official_dealer_required", "certification"],
+            "procurement", participation_barriers=barriers,
         ))
-        self.assertEqual(validated["participation_barriers"], ["official_dealer_required", "certification"])
+        self.assertEqual(validated["participation_barriers"], barriers)
+
+    def test_source_conflicts_round_trip(self):
+        validated = schema.validate_deep_analysis_result(make_deep_result(
+            "logistics", source_conflicts=[make_source_conflict()],
+        ))
+        self.assertEqual(validated["source_conflicts"], [make_source_conflict()])
+
+    def test_invalid_source_conflict_rejected(self):
+        with self.assertRaises(ValueError):
+            schema.validate_deep_analysis_result(make_deep_result(
+                "logistics", source_conflicts=[{"sources": []}],
+            ))
+
+    def test_confidence_enum_validated(self):
+        with self.assertRaises(ValueError):
+            schema.validate_deep_analysis_result(make_deep_result("logistics", confidence="certain"))
+
+    def test_contracting_authority_and_procedure_code_optional(self):
+        validated = schema.validate_deep_analysis_result(make_deep_result(
+            "logistics", contracting_authority=None, procedure_code=None,
+        ))
+        self.assertIsNone(validated["contracting_authority"])
+        self.assertIsNone(validated["procedure_code"])
 
     def test_missing_information_must_be_strings(self):
         with self.assertRaises(ValueError):

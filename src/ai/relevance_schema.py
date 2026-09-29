@@ -9,6 +9,17 @@ STAGE 1 = TRIAGE: relevant / maybe / not_relevant, быстрая классиф
 (validate_triage_result). STAGE 2 = DEEP ANALYSIS: структурированный разбор,
 отдельные поля для procurement и logistics (validate_deep_analysis_result).
 
+DEEP ANALYSIS расширен под procurement (см. src.ai.deep_prompt / src.ai.openai_deep_analysis):
+participation_barriers и source_conflicts — объекты, а не enum-строки (type/description/
+severity/evidence и sources/conflict_description/impact соответственно); procurement.items/
+lots — структурированные позиции (item_name/lot_number/quantity/unit/key_specifications/
+evidence и lot_number/description/item_count/evidence), а не произвольные списки;
+procurement.brand_or_equivalent — объект (specified_brand/equivalent_allowed), не строка;
+добавлены contracting_authority/procedure_code/confidence (common) и total_lots
+(procurement). Это единственное существенное изменение архитектуры схемы в рамках задачи
+"deep analysis layer" — сохраняет обратную совместимость по количеству stage'ов и смыслу
+существующих полей (item/lot/barrier/conflict были невыразимы как объекты до этого).
+
 Все validate_* функции принимают dict "как есть от AI" (или fake analyzer в тестах)
 и возвращают новый нормализованный dict; входной dict не изменяется. Неизвестные enum
 значения, неизвестные ключи верхнего уровня и нарушение бизнес-правил (например
@@ -63,6 +74,28 @@ PARTICIPATION_BARRIER_TYPES = (
     "other",
 )
 
+# Один participation barrier — не enum-строка, а объект: тип + человекочитаемое описание +
+# severity (та же градация, что и confidence, см. CONFIDENCE_LEVELS) + evidence (обязательно
+# непустой: барьер не может быть заявлен без реальной цитаты из источника, правило проекта №1/9).
+PARTICIPATION_BARRIER_FIELDS = ("type", "description", "severity", "evidence")
+
+# Конфликт между источниками одного тендера (announcement/enrichment/document описывают
+# разные факты). sources — какие source_type конфликтуют (см. EVIDENCE_SOURCE_TYPES).
+SOURCE_CONFLICT_FIELDS = ("sources", "conflict_description", "impact")
+
+# Одна позиция (товар) в рамках procurement lot(s). item_name обязателен — остальное null,
+# если не удалось извлечь (правило проекта №1: не выдумывать quantity/unit).
+PROCUREMENT_ITEM_FIELDS = ("item_name", "lot_number", "quantity", "unit", "key_specifications", "evidence")
+
+# Структурированная сводка по одному лоту (для тендеров с десятками/сотнями лотов — без
+# необходимости перечислять каждую позицию, см. deep analysis правило №3).
+PROCUREMENT_LOT_FIELDS = ("lot_number", "description", "item_count", "evidence")
+
+# brand_or_equivalent как объект, а не свободный текст (правило проекта №8): specified_brand —
+# марка/модель, если упомянута; equivalent_allowed — True/False, если правило эквивалента прямо
+# указано в источнике, иначе None ("не видно из документа", правило deep analysis №5).
+BRAND_OR_EQUIVALENT_FIELDS = ("specified_brand", "equivalent_allowed")
+
 # Evidence text — короткая цитата/указатель на источник, не пересказ документа целиком.
 EVIDENCE_TEXT_MAX_CHARS = 500
 
@@ -83,8 +116,12 @@ DEEP_ANALYSIS_COMMON_FIELDS = (
     "opportunity_type",
     "category",
     "why_interesting",
+    "contracting_authority",
+    "procedure_code",
+    "confidence",
     "participation_barriers",
     "missing_information",
+    "source_conflicts",
     "manual_review_required",
     "evidence",
     "procurement",
@@ -94,12 +131,14 @@ DEEP_ANALYSIS_COMMON_FIELDS = (
 PROCUREMENT_SCALAR_FIELDS = (
     "subject",
     "quantity_summary",
-    "brand_or_equivalent",
     "delivery_location",
     "delivery_deadline",
     "warranty",
     "estimated_value_amd",
+    "total_lots",
 )
+# brand_or_equivalent — структурированный объект (см. BRAND_OR_EQUIVALENT_FIELDS), не строка.
+PROCUREMENT_OBJECT_FIELDS = ("brand_or_equivalent",)
 PROCUREMENT_LIST_FIELDS = (
     "items",
     "lots",
@@ -107,7 +146,7 @@ PROCUREMENT_LIST_FIELDS = (
     "country_of_origin_requirements",
     "certifications",
 )
-PROCUREMENT_FIELDS = PROCUREMENT_SCALAR_FIELDS + PROCUREMENT_LIST_FIELDS
+PROCUREMENT_FIELDS = PROCUREMENT_SCALAR_FIELDS + PROCUREMENT_OBJECT_FIELDS + PROCUREMENT_LIST_FIELDS
 
 LOGISTICS_SCALAR_FIELDS = (
     "service",
@@ -208,6 +247,22 @@ def _str_list(value, field_name: str, what: str) -> list:
     return list(items)
 
 
+def _optional_bool(value, field_name: str, what: str):
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"{what}.{field_name} должен быть bool или None: {value!r}")
+    return value
+
+
+def _optional_nonneg_int(value, field_name: str, what: str):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{what}.{field_name} должен быть неотрицательным int или None: {value!r}")
+    return value
+
+
 # --------------------------------------------------------------------------
 # Evidence
 # --------------------------------------------------------------------------
@@ -247,14 +302,71 @@ def validate_evidence_list(evidence, what: str) -> list:
     return [validate_evidence_item(item) for item in evidence]
 
 
+def validate_participation_barrier(item: dict) -> dict:
+    """
+    Один participation barrier: type (PARTICIPATION_BARRIER_TYPES), description (непустая
+    строка), severity (CONFIDENCE_LEVELS — та же градация, что и confidence), evidence
+    (обязательно непустой list, см. модульный docstring). ValueError — неизвестный enum,
+    отсутствующее/лишнее поле, пустой evidence или невалидный evidence item.
+    """
+    item = _require_dict(item, "participation barrier")
+    _require_exact_keys(item, PARTICIPATION_BARRIER_FIELDS, "participation barrier")
+
+    barrier_type = _require_enum(item["type"], PARTICIPATION_BARRIER_TYPES, "type", "participation barrier")
+    description = _require_nonblank_str(item["description"], "description", "participation barrier")
+    severity = _require_enum(item["severity"], CONFIDENCE_LEVELS, "severity", "participation barrier")
+    evidence = validate_evidence_list(item["evidence"], "participation barrier")
+    if not evidence:
+        raise ValueError(
+            "participation barrier: evidence не может быть пустым (правило проекта №1: "
+            "нельзя утверждать наличие барьера без подтверждения в источнике)"
+        )
+
+    return {
+        "type": barrier_type,
+        "description": description,
+        "severity": severity,
+        "evidence": evidence,
+    }
+
+
 def validate_participation_barriers(barriers) -> list:
     if not isinstance(barriers, list):
         raise ValueError(f"participation_barriers должен быть list: {barriers!r}")
-    validated = []
-    for barrier in barriers:
-        _require_enum(barrier, PARTICIPATION_BARRIER_TYPES, "participation_barriers[]", "deep analysis")
-        validated.append(barrier)
-    return validated
+    return [validate_participation_barrier(barrier) for barrier in barriers]
+
+
+def validate_source_conflict(item: dict) -> dict:
+    """
+    Один source conflict: sources (непустой list source_type из EVIDENCE_SOURCE_TYPES,
+    которые конфликтуют), conflict_description, impact — непустые строки. ValueError —
+    отсутствующее/лишнее поле, пустой/невалидный sources, пустое описание.
+    """
+    item = _require_dict(item, "source conflict")
+    _require_exact_keys(item, SOURCE_CONFLICT_FIELDS, "source conflict")
+
+    sources = item["sources"]
+    if not isinstance(sources, list) or not sources:
+        raise ValueError(f"source conflict.sources должен быть непустым list: {sources!r}")
+    for source in sources:
+        _require_enum(source, EVIDENCE_SOURCE_TYPES, "sources[]", "source conflict")
+
+    conflict_description = _require_nonblank_str(
+        item["conflict_description"], "conflict_description", "source conflict"
+    )
+    impact = _require_nonblank_str(item["impact"], "impact", "source conflict")
+
+    return {
+        "sources": list(sources),
+        "conflict_description": conflict_description,
+        "impact": impact,
+    }
+
+
+def validate_source_conflicts(conflicts) -> list:
+    if not isinstance(conflicts, list):
+        raise ValueError(f"source_conflicts должен быть list: {conflicts!r}")
+    return [validate_source_conflict(conflict) for conflict in conflicts]
 
 
 # --------------------------------------------------------------------------
@@ -315,16 +427,98 @@ def validate_triage_result(result: dict) -> dict:
 # STAGE 2: deep analysis
 # --------------------------------------------------------------------------
 
+def validate_procurement_item(item: dict) -> dict:
+    """
+    Одна позиция (товар) procurement lot(s). item_name обязателен (правило deep analysis
+    №3: специалист должен увидеть реальные позиции); lot_number/quantity/unit — null, если
+    не удалось извлечь (не выдумывать); key_specifications — список строк (может быть
+    пустым); evidence обязательно непустой (позиция не может быть заявлена без цитаты).
+    """
+    item = _require_dict(item, "procurement item")
+    _require_exact_keys(item, PROCUREMENT_ITEM_FIELDS, "procurement item")
+
+    item_name = _require_nonblank_str(item["item_name"], "item_name", "procurement item")
+    lot_number = _optional_str(item["lot_number"], "lot_number", "procurement item")
+    quantity = _optional_str(item["quantity"], "quantity", "procurement item")
+    unit = _optional_str(item["unit"], "unit", "procurement item")
+    key_specifications = _str_list(item["key_specifications"], "key_specifications", "procurement item")
+    evidence = validate_evidence_list(item["evidence"], "procurement item")
+    if not evidence:
+        raise ValueError(
+            "procurement item: evidence не может быть пустым (позиция не может быть "
+            "заявлена без подтверждения в источнике)"
+        )
+
+    return {
+        "item_name": item_name,
+        "lot_number": lot_number,
+        "quantity": quantity,
+        "unit": unit,
+        "key_specifications": key_specifications,
+        "evidence": evidence,
+    }
+
+
+def validate_procurement_lot(lot: dict) -> dict:
+    """
+    Структурированная сводка по одному лоту (для тендеров с десятками/сотнями лотов, где
+    перечислять каждую позицию нецелесообразно — правило deep analysis №3). lot_number
+    обязателен; description/item_count — null, если недоступны; evidence может быть пустым
+    (сводка по лоту допустима и без прямой цитаты, если основана на количестве лотов из
+    структуры документа).
+    """
+    lot = _require_dict(lot, "procurement lot")
+    _require_exact_keys(lot, PROCUREMENT_LOT_FIELDS, "procurement lot")
+
+    lot_number = _require_nonblank_str(lot["lot_number"], "lot_number", "procurement lot")
+    description = _optional_str(lot["description"], "description", "procurement lot")
+    item_count = _optional_nonneg_int(lot["item_count"], "item_count", "procurement lot")
+    evidence = validate_evidence_list(lot["evidence"], "procurement lot")
+
+    return {
+        "lot_number": lot_number,
+        "description": description,
+        "item_count": item_count,
+        "evidence": evidence,
+    }
+
+
+def validate_brand_or_equivalent(value):
+    """
+    None — марка не упомянута/не применимо. Иначе dict: specified_brand (строка или None),
+    equivalent_allowed (bool или None — "не видно из документа", правило deep analysis №5:
+    нельзя делать вывод о допустимости аналога, если это не указано явно).
+    """
+    if value is None:
+        return None
+    value = _require_dict(value, "brand_or_equivalent")
+    _require_exact_keys(value, BRAND_OR_EQUIVALENT_FIELDS, "brand_or_equivalent")
+    return {
+        "specified_brand": _optional_str(value["specified_brand"], "specified_brand", "brand_or_equivalent"),
+        "equivalent_allowed": _optional_bool(
+            value["equivalent_allowed"], "equivalent_allowed", "brand_or_equivalent"
+        ),
+    }
+
+
 def validate_procurement_block(block: dict) -> dict:
     block = _require_dict(block, "procurement block")
     _require_exact_keys(block, PROCUREMENT_FIELDS, "procurement block")
 
     result = {
         name: _optional_str(block[name], name, "procurement block")
-        for name in PROCUREMENT_SCALAR_FIELDS
+        for name in PROCUREMENT_SCALAR_FIELDS if name != "total_lots"
     }
-    for name in PROCUREMENT_LIST_FIELDS:
-        result[name] = _optional_list(block[name], name, "procurement block")
+    result["total_lots"] = _optional_nonneg_int(block["total_lots"], "total_lots", "procurement block")
+    result["brand_or_equivalent"] = validate_brand_or_equivalent(block["brand_or_equivalent"])
+    result["items"] = [
+        validate_procurement_item(item) for item in _optional_list(block["items"], "items", "procurement block")
+    ]
+    result["lots"] = [
+        validate_procurement_lot(lot) for lot in _optional_list(block["lots"], "lots", "procurement block")
+    ]
+    for name in ("technical_requirements", "country_of_origin_requirements", "certifications"):
+        result[name] = _str_list(block[name], name, "procurement block")
     return result
 
 
@@ -367,10 +561,16 @@ def validate_deep_analysis_result(result: dict) -> dict:
     why_interesting = _require_nonblank_str(
         result["why_interesting"], "why_interesting", "deep analysis result"
     )
+    contracting_authority = _optional_str(
+        result["contracting_authority"], "contracting_authority", "deep analysis result"
+    )
+    procedure_code = _optional_str(result["procedure_code"], "procedure_code", "deep analysis result")
+    confidence = _require_enum(result["confidence"], CONFIDENCE_LEVELS, "confidence", "deep analysis result")
     participation_barriers = validate_participation_barriers(result["participation_barriers"])
     missing_information = _str_list(
         result["missing_information"], "missing_information", "deep analysis result"
     )
+    source_conflicts = validate_source_conflicts(result["source_conflicts"])
     manual_review_required = _require_bool(
         result["manual_review_required"], "manual_review_required", "deep analysis result"
     )
@@ -400,8 +600,12 @@ def validate_deep_analysis_result(result: dict) -> dict:
         "opportunity_type": opportunity_type,
         "category": category,
         "why_interesting": why_interesting,
+        "contracting_authority": contracting_authority,
+        "procedure_code": procedure_code,
+        "confidence": confidence,
         "participation_barriers": participation_barriers,
         "missing_information": missing_information,
+        "source_conflicts": source_conflicts,
         "manual_review_required": manual_review_required,
         "evidence": evidence,
         "procurement": procurement,

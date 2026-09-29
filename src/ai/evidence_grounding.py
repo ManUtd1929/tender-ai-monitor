@@ -139,3 +139,74 @@ def validate_evidence_grounding(evidence: list, triage_context: dict) -> None:
             _check_context_field(item, triage_context, ENRICHMENT_EVIDENCE_FIELDS)
         else:
             _check_document(item, triage_context)
+
+
+# --------------------------------------------------------------------------
+# deep analysis (chunk-aware) grounding — не меняет ничего выше (triage grounding).
+#
+# deep_context (src.ai.deep_prompt.build_deep_context) содержит announcement/enrichment
+# те же имена полей, что и triage_context (ANNOUNCEMENT_EVIDENCE_FIELDS/
+# ENRICHMENT_EVIDENCE_FIELDS переиспользуются как есть), но вместо document_previews —
+# chunks (src.ai.tender_context.build_deep_analysis_context): документ мог быть разбит на
+# несколько chunk'ов. Для document evidence мы восстанавливаем полный текст документа
+# склейкой его chunk'ов по возрастанию index (chunk_id = "{download_id}:{member_name}:{index}",
+# "".join(chunks) == исходный extracted text — см. tender_context._chunk_text) и проверяем
+# quote тем же _require_quoted/normalize_evidence_text, что и triage: grounding не слабее.
+# --------------------------------------------------------------------------
+
+DEEP_DOCUMENT_EVIDENCE_FIELD = "text"
+
+
+def _chunk_index(chunk: dict) -> int:
+    return int(chunk["chunk_id"].rsplit(":", 1)[-1])
+
+
+def _reconstruct_document_text(deep_context: dict, download_id, member_name) -> str | None:
+    chunks = [
+        chunk for chunk in deep_context.get("chunks") or []
+        if chunk["download_id"] == download_id and chunk["member_name"] == member_name
+    ]
+    if not chunks:
+        return None
+    return "".join(chunk["text"] for chunk in sorted(chunks, key=_chunk_index))
+
+
+def _check_deep_document(item: dict, deep_context: dict) -> None:
+    download_id = item["download_id"]
+    member_name = item["member_name"]
+    documents = deep_context.get("documents") or []
+
+    if download_id not in {document["download_id"] for document in documents}:
+        raise ValueError(f"evidence: download_id={download_id!r} отсутствует в deep_context.documents")
+    if member_name is None or member_name not in {
+        document["member_name"] for document in documents if document["download_id"] == download_id
+    }:
+        raise ValueError(f"evidence: member_name={member_name!r} отсутствует у download_id={download_id}")
+    if item["field"] != DEEP_DOCUMENT_EVIDENCE_FIELD:
+        raise ValueError(
+            f"evidence: у document field должен быть {DEEP_DOCUMENT_EVIDENCE_FIELD!r}, получено {item['field']!r}"
+        )
+
+    text = _reconstruct_document_text(deep_context, download_id, member_name)
+    if not text:
+        raise ValueError(
+            f"evidence: у документа download_id={download_id} member_name={member_name!r} нет chunks в "
+            "deep_context.chunks, цитировать нечего"
+        )
+    _require_quoted(item, text, f"документ {member_name!r}")
+
+
+def validate_deep_evidence_grounding(evidence: list, deep_context: dict) -> None:
+    """
+    ValueError на первом evidence item, который нельзя обосновать по deep_context
+    (src.ai.deep_prompt.build_deep_context). announcement/enrichment проверяются как в
+    triage (_check_context_field); document — по восстановленному из chunks тексту.
+    """
+    for item in evidence:
+        source_type = item["source_type"]
+        if source_type == "announcement":
+            _check_context_field(item, deep_context, ANNOUNCEMENT_EVIDENCE_FIELDS)
+        elif source_type == "enrichment":
+            _check_context_field(item, deep_context, ENRICHMENT_EVIDENCE_FIELDS)
+        else:
+            _check_deep_document(item, deep_context)

@@ -221,5 +221,84 @@ class ConstantsTests(unittest.TestCase):
             relevance_schema.validate_evidence_item(item(text="x" * (relevance_schema.EVIDENCE_TEXT_MAX_CHARS + 1)))
 
 
+# --------------------------------------------------------------------------
+# deep analysis (chunk-aware) grounding
+# --------------------------------------------------------------------------
+
+DEEP_CONTEXT = {
+    "resource_url": "https://example.test/resource/1",
+    "title": CONTEXT["title"],
+    "section": CONTEXT["section"],
+    "resource_type": CONTEXT["resource_type"],
+    "published_at": CONTEXT["published_at"],
+    "deadline_at": CONTEXT["deadline_at"],
+    "detail_titles": CONTEXT["detail_titles"],
+    "description": CONTEXT["description"],
+    "procurement_type": CONTEXT["procurement_type"],
+    "procedure_type": CONTEXT["procedure_type"],
+    "contracting_authority": CONTEXT["contracting_authority"],
+    "estimated_value_amd": CONTEXT["estimated_value_amd"],
+    "dates": CONTEXT["dates"],
+    "cpv_codes": CONTEXT["cpv_codes"],
+    "documents": [
+        {"download_id": 7, "member_name": "spec.docx", "file_type": "docx", "extraction_status": "success"},
+        {"download_id": 8, "member_name": "notes.docx", "file_type": "docx", "extraction_status": "success"},
+    ],
+    "chunks": [
+        {"chunk_id": "7:spec.docx:0", "download_id": 7, "member_name": "spec.docx", "file_type": "docx",
+         "text": "Дверь стальная, 2 шт.\nГаран"},
+        {"chunk_id": "7:spec.docx:1", "download_id": 7, "member_name": "spec.docx", "file_type": "docx",
+         "text": "тия 24 месяца.\tДоставка в Ереван."},
+    ],
+}
+
+
+def deep_document_item(text, download_id=7, member_name="spec.docx", field=None) -> dict:
+    if field is None:
+        field = evidence_grounding.DEEP_DOCUMENT_EVIDENCE_FIELD
+    return item("document", field, text, download_id, member_name)
+
+
+class DeepDocumentEvidenceTests(unittest.TestCase):
+    def assertGrounded(self, *evidence):
+        evidence_grounding.validate_deep_evidence_grounding(list(evidence), DEEP_CONTEXT)
+
+    def assertRejected(self, *evidence, contains=None):
+        with self.assertRaises(ValueError) as context:
+            evidence_grounding.validate_deep_evidence_grounding(list(evidence), DEEP_CONTEXT)
+        if contains:
+            self.assertIn(contains, str(context.exception))
+        return context.exception
+
+    def test_quote_within_a_single_chunk_passes(self):
+        self.assertGrounded(deep_document_item("Дверь стальная, 2 шт."))
+
+    def test_quote_spanning_a_chunk_boundary_passes(self):
+        # "Гаран" — конец chunk 0, "тия 24 месяца." — начало chunk 1: реконструированный
+        # полный текст документа склеивает их без потери/дублирования.
+        self.assertGrounded(deep_document_item("Гарантия 24 месяца."))
+
+    def test_translated_or_paraphrased_fragment_is_rejected(self):
+        self.assertRejected(deep_document_item("Steel door, 2 pcs."), contains="дословным")
+
+    def test_field_must_be_deep_document_field_not_triage_preview_text(self):
+        self.assertRejected(deep_document_item("Дверь стальная", field="preview_text"), contains="text")
+
+    def test_wrong_download_id_is_rejected(self):
+        self.assertRejected(deep_document_item("Дверь стальная", download_id=999), contains="download_id")
+
+    def test_wrong_member_name_is_rejected(self):
+        self.assertRejected(deep_document_item("Дверь стальная", member_name="other.docx"), contains="member_name")
+
+    def test_document_without_chunks_cannot_be_quoted(self):
+        self.assertRejected(deep_document_item("x", download_id=8, member_name="notes.docx"), contains="chunks")
+
+    def test_announcement_and_enrichment_evidence_reused_unchanged(self):
+        self.assertGrounded(
+            item(text=DEEP_CONTEXT["title"]),
+            item("enrichment", "description", "поставка стальных дверей для здания."),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

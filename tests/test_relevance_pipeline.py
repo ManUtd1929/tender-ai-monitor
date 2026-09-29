@@ -20,9 +20,10 @@ LOGISTICS_FIELDS = (
     "volume", "frequency", "customs_requirements", "insurance_requirements", "special_conditions",
 )
 PROCUREMENT_SCALAR_FIELDS = (
-    "subject", "quantity_summary", "brand_or_equivalent", "delivery_location",
-    "delivery_deadline", "warranty", "estimated_value_amd",
+    "subject", "quantity_summary", "delivery_location",
+    "delivery_deadline", "warranty", "estimated_value_amd", "total_lots",
 )
+PROCUREMENT_OBJECT_FIELDS = ("brand_or_equivalent",)
 PROCUREMENT_LIST_FIELDS = ("items", "lots", "technical_requirements", "country_of_origin_requirements", "certifications")
 
 
@@ -107,12 +108,29 @@ def maybe_procurement_triage(**overrides) -> dict:
     return result
 
 
+def barrier(**overrides) -> dict:
+    item = {
+        "type": "official_dealer_required",
+        "description": "Требуется официальный дилер производителя",
+        "severity": "medium",
+        "evidence": [{
+            "source_type": "document", "field": "text", "download_id": 1,
+            "member_name": "spec.docx", "text": "официальный дилер",
+        }],
+    }
+    item.update(overrides)
+    return item
+
+
 def logistics_deep(**overrides) -> dict:
     result = {
         "summary": "Международная перевозка груза автомобильным транспортом",
         "opportunity_type": "logistics", "category": "international_freight",
-        "why_interesting": "Логистическая услуга", "participation_barriers": [],
-        "missing_information": [], "manual_review_required": False, "evidence": [],
+        "why_interesting": "Логистическая услуга",
+        "contracting_authority": None, "procedure_code": None, "confidence": "high",
+        "participation_barriers": [],
+        "missing_information": [], "source_conflicts": [],
+        "manual_review_required": False, "evidence": [],
         "procurement": None,
         "logistics": {name: None for name in LOGISTICS_FIELDS} | {"service": "Международная перевозка"},
     }
@@ -121,14 +139,20 @@ def logistics_deep(**overrides) -> dict:
 
 
 def procurement_deep(**overrides) -> dict:
-    block = {name: None for name in PROCUREMENT_SCALAR_FIELDS} | {name: [] for name in PROCUREMENT_LIST_FIELDS}
+    block = (
+        {name: None for name in PROCUREMENT_SCALAR_FIELDS}
+        | {name: None for name in PROCUREMENT_OBJECT_FIELDS}
+        | {name: [] for name in PROCUREMENT_LIST_FIELDS}
+    )
     block["subject"] = "Поставка компьютерной техники"
     result = {
         "summary": "Закупка компьютерной техники с последующим импортом",
         "opportunity_type": "procurement", "category": "electronics",
         "why_interesting": "Возможна закупка у зарубежного поставщика",
-        "participation_barriers": ["official_dealer_required"],
-        "missing_information": [], "manual_review_required": True, "evidence": [],
+        "contracting_authority": None, "procedure_code": None, "confidence": "medium",
+        "participation_barriers": [barrier()],
+        "missing_information": [], "source_conflicts": [],
+        "manual_review_required": True, "evidence": [],
         "procurement": block, "logistics": None,
     }
     result.update(overrides)

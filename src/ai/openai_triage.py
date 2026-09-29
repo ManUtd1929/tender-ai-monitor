@@ -191,6 +191,11 @@ def _output_parts(response) -> tuple[str, str | None]:
     return "".join(texts), refusal
 
 
+# Публичные алиасы: переиспользуются STAGE 2 (src.ai.openai_deep_analysis) без дублирования.
+usage_dict = _usage_dict
+output_parts = _output_parts
+
+
 def classify_api_error(error: Exception) -> tuple[str, bool]:
     """(kind, retryable) для исключения SDK."""
     if isinstance(error, openai.APITimeoutError):
@@ -205,6 +210,38 @@ def classify_api_error(error: Exception) -> tuple[str, bool]:
     if isinstance(error, openai.APIStatusError):
         return KIND_API_ERROR, error.status_code >= 500 or error.status_code in _TRANSIENT_STATUS_CODES
     return KIND_API_ERROR, False
+
+
+def retry_create(
+    client, request: dict, *, timeout: float, max_attempts: int, retry_base_delay: float,
+    sleep, error_class, redact=lambda text: text,
+):
+    """
+    Общий bounded-retry вокруг client.responses.create, переиспользуемый STAGE 1 (triage,
+    см. OpenAITriageAnalyzer._create_with_retry) и STAGE 2 (src.ai.openai_deep_analysis):
+    (response, attempts). Повторяет только transient ошибки (classify_api_error), не более
+    max_attempts. error_class — исключение с сигнатурой (kind, message, attempts=...)
+    (TriageError и наследники), которое бросается при неповторяемой/исчерпанной ошибке.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.responses.create(**request, timeout=timeout), attempt
+        except openai.OpenAIError as error:
+            kind, retryable = classify_api_error(error)
+            if retryable and attempt < max_attempts:
+                delay = min(retry_base_delay * 2 ** (attempt - 1), MAX_RETRY_DELAY_SECONDS)
+                logger.warning(
+                    "OpenAI transient ошибка (%s, %s), попытка %d/%d, повтор через %.1f с",
+                    kind, type(error).__name__, attempt, max_attempts, delay,
+                )
+                sleep(delay)
+                continue
+            if kind == KIND_AUTHENTICATION:
+                message = "OpenAI отклонил API key/доступ (authentication/permission)"
+            else:
+                message = redact(f"{type(error).__name__}: {error}")
+            logger.error("OpenAI вызов не удался (%s) после %d попыток: %s", kind, attempt, message)
+            raise error_class(kind, message, attempts=attempt) from error
 
 
 # --------------------------------------------------------------------------
@@ -277,25 +314,11 @@ class OpenAITriageAnalyzer:
 
     def _create_with_retry(self, client, request: dict):
         """(response, attempts). Повторяет только transient ошибки, не более max_attempts."""
-        for attempt in range(1, self.max_attempts + 1):
-            try:
-                return client.responses.create(**request, timeout=self.timeout), attempt
-            except openai.OpenAIError as error:
-                kind, retryable = classify_api_error(error)
-                if retryable and attempt < self.max_attempts:
-                    delay = min(self.retry_base_delay * 2 ** (attempt - 1), MAX_RETRY_DELAY_SECONDS)
-                    logger.warning(
-                        "OpenAI transient ошибка (%s, %s), попытка %d/%d, повтор через %.1f с",
-                        kind, type(error).__name__, attempt, self.max_attempts, delay,
-                    )
-                    self._sleep(delay)
-                    continue
-                if kind == KIND_AUTHENTICATION:
-                    message = "OpenAI отклонил API key/доступ (authentication/permission)"
-                else:
-                    message = self._redact(f"{type(error).__name__}: {error}")
-                logger.error("OpenAI вызов не удался (%s) после %d попыток: %s", kind, attempt, message)
-                raise TriageError(kind, message, attempts=attempt) from error
+        return retry_create(
+            client, request, timeout=self.timeout, max_attempts=self.max_attempts,
+            retry_base_delay=self.retry_base_delay, sleep=self._sleep,
+            error_class=TriageError, redact=self._redact,
+        )
 
     # -- public API --------------------------------------------------------
 
