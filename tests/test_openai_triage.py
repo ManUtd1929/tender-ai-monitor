@@ -32,10 +32,10 @@ TRIAGE_CONTEXT = {
     "resource_url": "https://example.test/resource/1",
     "title": "Поставка мебели",
     "description": "Закупка офисной мебели",
-    "cpv_codes": [],
+    "cpv_codes": [{"code": "39100000", "name": "Мебель"}],
     "documents": [{"download_id": 7, "member_name": "spec.docx", "file_type": "docx", "extraction_status": "success"}],
     "document_previews": [
-        {"download_id": 7, "member_name": "spec.docx", "file_type": "docx", "preview_text": "Стол, стул", "truncated": False},
+        {"download_id": 7, "member_name": "spec.docx", "file_type": "docx", "preview_text": "Стол, стул\nШкаф", "truncated": False},
     ],
 }
 
@@ -140,7 +140,7 @@ class SettingsTests(unittest.TestCase):
         analyzer = openai_triage.OpenAITriageAnalyzer(client=FakeClient(), environ={})
         self.assertEqual(analyzer.model, "gpt-5.6-terra")
         self.assertEqual(analyzer.reasoning_effort, "medium")
-        self.assertEqual(analyzer.prompt_version, "procurement-v1")
+        self.assertEqual(analyzer.prompt_version, "procurement-v2")
 
     def test_environment_overrides(self):
         analyzer = openai_triage.OpenAITriageAnalyzer(
@@ -271,8 +271,34 @@ class ValidResponseTests(unittest.TestCase):
         self.assertAccepted(MAYBE_UNCLEAR)
 
     def test_document_evidence_with_real_reference(self):
-        evidence = [evidence_item(source_type="document", field="preview_text", download_id=7, member_name="spec.docx")]
+        evidence = [evidence_item(
+            source_type="document", field="preview_text", download_id=7, member_name="spec.docx", text="Стол, стул",
+        )]
         self.assertAccepted({"evidence": evidence})
+
+    def test_verbatim_announcement_evidence(self):
+        self.assertAccepted({"evidence": [evidence_item(field="title", text="Поставка мебели")]})
+
+    def test_verbatim_enrichment_evidence(self):
+        evidence = [
+            evidence_item(source_type="enrichment", field="description", text="офисной мебели"),
+            evidence_item(source_type="enrichment", field="cpv_codes", text="Мебель"),
+        ]
+        self.assertAccepted({"evidence": evidence})
+
+    def test_evidence_whitespace_normalization(self):
+        evidence = [evidence_item(
+            source_type="document", field="preview_text", download_id=7, member_name="spec.docx",
+            text="стул  Шкаф",
+        )]
+        self.assertAccepted({"evidence": evidence})
+
+    def test_new_category_outside_canonical_vocabulary_is_accepted(self):
+        self.assertNotIn("brand_new_goods", triage_prompt.GOODS_CATEGORIES + triage_prompt.SERVICE_CATEGORIES)
+        self.assertAccepted({"category": "brand_new_goods"})
+
+    def test_canonical_category_is_accepted(self):
+        self.assertAccepted({"category": triage_prompt.GOODS_CATEGORIES[0]})
 
     def test_usage_metadata(self):
         outcome = self.assertAccepted({})
@@ -364,6 +390,39 @@ class ApplicationValidationTests(unittest.TestCase):
             evidence_item(source_type="document", download_id=7, member_name="other.docx"),
             evidence_item(source_type="document", download_id=None, member_name=None),
             evidence_item(source_type="announcement", download_id=7),
+        ):
+            with self.subTest(item=item):
+                self.assertRejected(make_response(payload(evidence=[item])))
+
+    def test_translated_or_paraphrased_evidence_rejected(self):
+        for item in (
+            evidence_item(text="Supply of furniture"),
+            evidence_item(text="Поставка мебели (purchase of furniture)"),
+            evidence_item(text="Поставка... (закупка мебели)"),
+            evidence_item(source_type="enrichment", field="description", text="Purchase of office furniture"),
+            evidence_item(
+                source_type="document", field="preview_text", download_id=7, member_name="spec.docx",
+                text="Table, chair",
+            ),
+        ):
+            with self.subTest(item=item):
+                error = self.assertRejected(make_response(payload(evidence=[item])))
+                self.assertIn("дословным", str(error))
+
+    def test_nonexistent_evidence_field_rejected(self):
+        for item in (
+            evidence_item(field="no_such_field"),
+            evidence_item(field=None),
+            evidence_item(source_type="enrichment", field="title"),
+            evidence_item(source_type="document", field="text", download_id=7, member_name="spec.docx"),
+        ):
+            with self.subTest(item=item):
+                self.assertRejected(make_response(payload(evidence=[item])))
+
+    def test_evidence_with_wrong_download_id_or_member_name_rejected(self):
+        for item in (
+            evidence_item(source_type="document", field="preview_text", download_id=8, member_name="spec.docx", text="Стол"),
+            evidence_item(source_type="document", field="preview_text", download_id=7, member_name="other.docx", text="Стол"),
         ):
             with self.subTest(item=item):
                 self.assertRejected(make_response(payload(evidence=[item])))
@@ -520,7 +579,8 @@ class PipelineCompatibilityTests(unittest.TestCase):
             announcement_repository.save_announcement(announcement, db_path)
             enrichment_repository.save_enrichment(announcement["resource_url"], make_enrichment(), db_path)
 
-            analyzer, client, _ = make_analyzer(make_response(payload()))
+            # evidence должен цитировать реальный title из БД, а не выдуманный текст
+            analyzer, client, _ = make_analyzer(make_response(payload(evidence=[evidence_item(text="Тендер 1")])))
             summary = relevance_pipeline.run_triage(
                 analyzer, db_path=db_path, provider=analyzer.provider, model=analyzer.model,
                 prompt_version=analyzer.prompt_version,
@@ -530,7 +590,7 @@ class PipelineCompatibilityTests(unittest.TestCase):
             self.assertEqual(summary["relevant_count"], 1)
             stored = analysis_repository.get_triage(announcement["resource_url"], db_path=db_path)
             self.assertEqual(stored["provider"], "openai")
-            self.assertEqual(stored["prompt_version"], "procurement-v1")
+            self.assertEqual(stored["prompt_version"], "procurement-v2")
             self.assertEqual(len(client.responses.calls), 1)
 
 

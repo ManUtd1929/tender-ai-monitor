@@ -8,15 +8,17 @@ Structured Outputs строится из его констант, а не дуб
 opportunity_type logistics / logistics_and_procurement остаются в relevance_schema
 (нужны для будущего расширения), но в procurement-MVP схему модели не попадают.
 
-Golden set сюда не подмешивается: prompt не содержит case_id, заголовков, категорий
-или ответов golden set (это проверяет tests/test_triage_prompt.py).
+Golden set сюда не подмешивается: prompt не содержит case_id, resource_url, заголовков,
+expected_reason или ответов golden set (это проверяет tests/test_triage_prompt.py).
+Канонический словарь категорий (GOODS_CATEGORIES / SERVICE_CATEGORIES) — статическая
+продуктовая таксономия, заданная в коде; из golden set она не читается и не выводится.
 """
 
 import json
 
-from src.ai import relevance_schema
+from src.ai import evidence_grounding, relevance_schema
 
-TRIAGE_PROMPT_VERSION = "procurement-v1"
+TRIAGE_PROMPT_VERSION = "procurement-v2"
 
 TRIAGE_OUTPUT_NAME = "tender_triage"
 
@@ -29,7 +31,33 @@ MVP_OPPORTUNITY_TYPES = tuple(
     if opportunity_type not in LOGISTICS_OPPORTUNITY_TYPES
 )
 
-SYSTEM_PROMPT = """\
+# Канонический словарь категорий: явная бизнес-политика (не benchmark и не данные golden set).
+# Если категория из словаря явно подходит, модель обязана использовать ровно это значение;
+# category остаётся строкой, для действительно новых типов допустима новая snake_case метка.
+GOODS_CATEGORIES = (
+    "aviation_fuel",
+    "blinds",
+    "computer_equipment",
+    "drinking_water",
+    "household_goods",
+    "infrastructure_goods",
+    "laboratory_supplies",
+    "medical_equipment",
+    "modular_buildings",
+    "pharmaceuticals_and_lab_supplies",
+    "plants",
+    "tires",
+)
+SERVICE_CATEGORIES = (
+    "archiving_services",
+    "design_and_cost_estimation",
+    "expertise_services",
+    "software_license",
+    "sports_event_services",
+    "technical_supervision",
+)
+
+_SYSTEM_PROMPT_TEMPLATE = """\
 You are the first-stage (triage) classifier of a public-procurement monitoring system.
 You receive one tender as a JSON object (TENDER_CONTEXT) and decide whether it is the
 kind of opportunity the business is looking for. You do not analyse participation
@@ -54,23 +82,39 @@ relevance_status:
 
 Decide by the primary subject of the procurement. If supplying physical goods to the
 customer is a meaningful part of the subject, the tender is about goods. If the subject
-is works or services and materials are merely consumed while performing them, it is not.
+is works or services and materials are merely consumed or installed while performing
+them, it is not.
 
 opportunity_type (only these values are allowed):
-- "procurement": physical goods are procured (use with relevance_status "relevant").
-- "other_service": the subject is a service or works, not goods (with "not_relevant").
-- "unrelated": clearly not an opportunity of interest and not a service that fits a
-  service category (with "not_relevant").
+- "procurement": the primary subject is the delivery, supply or acquisition of physical
+  goods (use with relevance_status "relevant").
+- "other_service": the primary subject is a non-physical service (use with
+  "not_relevant"). This includes technical supervision, design, consulting, expert
+  review, archiving, event organization, software licence or software service, audit,
+  training and similar professional or digital services.
+- "unrelated": the primary subject is construction, reconstruction, repair, installation
+  or other civil works, i.e. the customer buys the execution or result of works rather
+  than standalone supplied physical goods (use with "not_relevant"). Materials or
+  equipment that are consumed or installed as part of works do NOT turn a works tender
+  into "procurement". Also use "unrelated" for anything else clearly not of interest
+  that is neither goods nor a professional or digital service.
 - "unclear": the available data is genuinely insufficient to determine the type
   (only together with relevance_status "maybe").
-Use exactly these combinations: relevant + procurement, not_relevant + other_service or
-unrelated, maybe + unclear.
+Use exactly these combinations: relevant + procurement; not_relevant + other_service for
+professional or non-goods services; not_relevant + unrelated for construction,
+reconstruction, repair and civil works (and other clearly unrelated subjects); maybe +
+unclear.
 
 category:
 - procurement and other_service: a normalized snake_case English label (lowercase letters,
-  digits and underscores) describing the goods or the service, never null. Invent a new
-  label when the goods or service type is new; the label style is like "office_furniture",
-  "vehicle_spare_parts", "cleaning_services", "staff_training".
+  digits and underscores) describing the goods or the service, never null.
+- Canonical categories. When one of these clearly applies you MUST use exactly this
+  value, without synonyms, prefixes, suffixes or rewording:
+    goods: {goods_categories}
+    services: {service_categories}
+- Only when none of the canonical categories fits a genuinely new kind of goods or service,
+  create a concise normalized snake_case label (for example "office_furniture",
+  "vehicle_spare_parts", "cleaning_services").
 - unrelated and unclear: null.
 
 confidence: "high", "medium" or "low". Lower it when the evidence is thin or ambiguous.
@@ -80,16 +124,25 @@ requires_deep_analysis: true for relevant and for maybe; false for not_relevant.
 reason: one or two short sentences in Russian explaining the decision, based only on the
 context.
 
-evidence: a list of short facts or quotes taken from TENDER_CONTEXT (each at most 500
-characters) that support the decision. Every item has source_type, field, download_id,
-member_name and text:
-- source_type "announcement": top-level keys title, section, resource_type, published_at,
-  deadline_at; put the key name in field; download_id and member_name are null.
-- source_type "enrichment": keys detail_titles, description, procurement_type,
-  procedure_type, contracting_authority, estimated_value_amd, dates, cpv_codes; put the key
-  name in field; download_id and member_name are null.
+evidence: a list of short quotes taken from TENDER_CONTEXT (each at most 500 characters)
+that support the decision. Every item has source_type, field, download_id, member_name and
+text:
+- source_type "announcement": top-level keys {announcement_fields}; put the key name in
+  field; download_id and member_name are null.
+- source_type "enrichment": top-level keys {enrichment_fields}; put the key name in
+  field; download_id and member_name are null.
 - source_type "document": an entry of document_previews; copy its download_id and
-  member_name exactly, field is "preview_text".
+  member_name exactly, field is "{document_field}". Quote only text that is actually present
+  in that preview_text; a document listed only in "documents" without a preview cannot be
+  quoted.
+evidence.text MUST be a verbatim, contiguous fragment copied character by character from
+the referenced field or preview_text, in its original language (Armenian, Russian or
+English). Never translate it, paraphrase it, append an explanation or a translation to it,
+shorten it with an ellipsis, or join fragments. For structured fields (detail_titles, dates,
+cpv_codes) quote from a single string value inside the field. Only whitespace and line
+breaks may differ from the source. If you cannot quote a fact verbatim, leave that item out.
+Explanations and paraphrases belong in reason, not in evidence. Application code rejects the
+whole answer if any evidence text is not found verbatim in its referenced source.
 Never invent page numbers, quotes, documents, download ids or file names.
 
 RULES THAT MUST BE FOLLOWED
@@ -116,7 +169,15 @@ RULES THAT MUST BE FOLLOWED
 6. Texts may be in Armenian, Russian or English. Do not use any tools or outside sources.
 """
 
-_STRING_OR_NULL = ["string", "null"]
+SYSTEM_PROMPT = _SYSTEM_PROMPT_TEMPLATE.format(
+    goods_categories=", ".join(GOODS_CATEGORIES),
+    service_categories=", ".join(SERVICE_CATEGORIES),
+    announcement_fields=", ".join(evidence_grounding.ANNOUNCEMENT_EVIDENCE_FIELDS),
+    enrichment_fields=", ".join(evidence_grounding.ENRICHMENT_EVIDENCE_FIELDS),
+    document_field=evidence_grounding.DOCUMENT_EVIDENCE_FIELD,
+)
+
+_STRING_OR_NULL =["string", "null"]
 _INTEGER_OR_NULL = ["integer", "null"]
 
 

@@ -20,7 +20,9 @@ from src.ai import golden_set, golden_set_evaluator as evaluator, openai_triage
 from src.database import enrichment_repository
 from tests import safety_guards
 from tests.test_golden_set import GoldenSetDbTestCase, make_expected
-from tests.test_openai_triage import FakeClient, make_response, payload, OTHER_SERVICE, UNRELATED, MAYBE_UNCLEAR
+from tests.test_openai_triage import (
+    FakeClient, make_response, payload, evidence_item, OTHER_SERVICE, UNRELATED, MAYBE_UNCLEAR,
+)
 
 API_KEY = "sk-test-secret-key-123"
 
@@ -435,7 +437,8 @@ class CliRunTests(EvaluatorTestCase):
 
     def test_artifact_never_contains_api_key(self):
         cases = self.make_golden(RELEVANT)
-        client = FakeClient(make_response(payload(category="computers")))
+        # evidence обязан дословно цитировать title, который реально уходит модели
+        client = FakeClient(make_response(payload(category="computers", evidence=[evidence_item(text="Тендер 1")])))
         analyzer = openai_triage.OpenAITriageAnalyzer(
             client=client, environ={"OPENAI_API_KEY": API_KEY}, sleep=lambda seconds: None,
         )

@@ -30,6 +30,7 @@ import time
 
 import openai
 
+from src.ai import evidence_grounding
 from src.ai import relevance_schema
 from src.ai import triage_prompt
 
@@ -118,9 +119,11 @@ def validate_mvp_triage_result(result: dict, triage_context: dict | None = None)
           unrelated, maybe+unclear;
         - category: snake_case, не null для procurement/other_service; null для
           unrelated/unclear;
-        - если передан triage_context: evidence source_type="document" должен ссылаться на
-          реальный download_id/member_name из context.documents, остальные источники не
-          могут иметь download_id/member_name (нельзя выдумывать источники).
+        - если передан triage_context: каждый evidence item проходит
+          evidence_grounding.validate_evidence_grounding — источник существует (поле
+          announcement/enrichment, реальные download_id/member_name документа) и
+          evidence.text — дословный фрагмент значения источника (только нормализация
+          whitespace); переведённый/перефразированный evidence отклоняется.
     Возвращает нормализованный результат validate_triage_result.
     """
     validated = relevance_schema.validate_triage_result(result)
@@ -149,30 +152,8 @@ def validate_mvp_triage_result(result: dict, triage_context: dict | None = None)
         raise ValueError(f"MVP: для opportunity_type={opportunity_type!r} category должна быть null: {category!r}")
 
     if triage_context is not None:
-        _check_evidence_grounding(validated["evidence"], triage_context)
+        evidence_grounding.validate_evidence_grounding(validated["evidence"], triage_context)
     return validated
-
-
-def _check_evidence_grounding(evidence: list, triage_context: dict) -> None:
-    members_by_download = {}
-    for document in triage_context.get("documents") or []:
-        members_by_download.setdefault(document["download_id"], set()).add(document["member_name"])
-
-    for item in evidence:
-        if item["source_type"] != "document":
-            if item["download_id"] is not None or item["member_name"] is not None:
-                raise ValueError(
-                    f"evidence: source_type={item['source_type']!r} не может иметь download_id/member_name"
-                )
-            continue
-        download_id = item["download_id"]
-        if download_id not in members_by_download:
-            raise ValueError(f"evidence: download_id={download_id!r} отсутствует в triage_context.documents")
-        member_name = item["member_name"]
-        if member_name is not None and member_name not in members_by_download[download_id]:
-            raise ValueError(
-                f"evidence: member_name={member_name!r} отсутствует у download_id={download_id}"
-            )
 
 
 # --------------------------------------------------------------------------
