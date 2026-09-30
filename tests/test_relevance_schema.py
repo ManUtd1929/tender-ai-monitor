@@ -61,7 +61,7 @@ def make_procurement_item(**overrides) -> dict:
         "lot_number": None,
         "quantity": "10",
         "unit": "шт.",
-        "key_specifications": [],
+        "key_specifications": [], "brand_or_equivalent": None,
         "evidence": [make_evidence()],
     }
     item.update(overrides)

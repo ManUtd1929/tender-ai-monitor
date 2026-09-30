@@ -11,7 +11,9 @@ tenders) остаётся в проекте как legacy и этим модул
 """
 
 import logging
+import os
 import sys
+from pathlib import Path
 
 from src.database.announcement_repository import (
     count_announcements,
@@ -25,6 +27,11 @@ from src.scraper.gnumner import configure_tls
 from src.scraper.sections import fetch_all_sections
 
 logger = logging.getLogger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# AI-анализ выключен по умолчанию: включается только явным AI_ANALYSIS_ENABLED=true.
+AI_ANALYSIS_ENV = "AI_ANALYSIS_ENABLED"
 
 # Сколько старых объявлений без enrichment или с неудавшимся refresh дообрабатывается за один запуск.
 PENDING_ENRICHMENT_RETRY_LIMIT = 3
@@ -99,6 +106,27 @@ def _load_document_candidates(resource_urls: list[str]) -> list[dict]:
             continue
         candidates.append(candidate)
     return candidates
+
+
+def ai_analysis_enabled() -> bool:
+    return os.environ.get(AI_ANALYSIS_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _run_ai_analysis_if_enabled() -> dict | None:
+    """
+    AI-анализ после enrichment/документов. Выключен (None, никаких импортов analyzers и client) пока
+    AI_ANALYSIS_ENABLED не true. Ошибка AI-стадии не прерывает мониторинг.
+    """
+    if not ai_analysis_enabled():
+        logger.info("AI-анализ выключен (%s не включён)", AI_ANALYSIS_ENV)
+        return None
+    from src.ai import analysis_pipeline  # ленивый импорт: при выключенном флаге AI-код не загружается
+
+    try:
+        return analysis_pipeline.run_ai_analysis()
+    except Exception as error:
+        logger.exception("AI-анализ завершился ошибкой; мониторинг продолжается")
+        return {"status": "error", "error_type": type(error).__name__, "error_message": str(error)}
 
 
 def run_monitor(page: int = 1) -> dict:
@@ -184,6 +212,8 @@ def run_monitor(page: int = 1) -> dict:
     document_result = process_enriched_announcements(document_candidates)
     pending_documents_after = document_repository.count_document_processing_candidates()
 
+    ai_analysis_result = _run_ai_analysis_if_enabled()
+
     return {
         "fetched_count": fetched_count,
         "unique_resource_count": unique_resource_count,
@@ -205,6 +235,7 @@ def run_monitor(page: int = 1) -> dict:
         "pending_document_retry_selected_count": len(pending_document_retry),
         "document_result": document_result,
         "pending_documents_after": pending_documents_after,
+        "ai_analysis": ai_analysis_result,
     }
 
 
@@ -293,6 +324,10 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    from dotenv import load_dotenv
+
+    load_dotenv(PROJECT_ROOT / ".env")  # не перезаписывает уже заданные переменные окружения
+
     result = run_monitor(page=1)
 
     print()
@@ -321,6 +356,11 @@ def main():
 
     _print_enrichment_summary(result)
     _print_document_summary(result)
+
+    ai_result = result["ai_analysis"]
+    if ai_result is not None:
+        print()
+        print(f"AI-анализ: {ai_result}")
 
 
 if __name__ == "__main__":

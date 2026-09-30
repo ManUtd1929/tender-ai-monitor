@@ -37,7 +37,7 @@ from src.ai import triage_prompt
 logger = logging.getLogger(__name__)
 
 PROVIDER = "openai"
-DEFAULT_MODEL = "gpt-5.6-terra"
+DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_REASONING_EFFORT = "medium"
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
@@ -82,27 +82,30 @@ class TriageError(Exception):
 
 def load_settings(environ=None, model: str | None = None, reasoning_effort: str | None = None) -> dict:
     """
-    {api_key, model, reasoning_effort}: явные аргументы > переменные окружения
-    (OPENAI_API_KEY, OPENAI_MODEL, OPENAI_TRIAGE_REASONING_EFFORT) > defaults. Пустая
+    {api_key, model, reasoning_effort}: явные аргументы (CLI --model) > TRIAGE_MODEL >
+    OPENAI_MODEL (legacy) > gpt-5.6-luna; effort: TRIAGE_REASONING_EFFORT >
+    OPENAI_TRIAGE_REASONING_EFFORT (legacy) > medium. Пустая
     строка считается "не задано". api_key может быть None — это не ошибка здесь.
     TriageError(config) — недопустимый reasoning effort.
     """
     environ = os.environ if environ is None else environ
 
-    def pick(explicit, name, default):
-        for value in (explicit, environ.get(name)):
+    def pick(explicit, names, default):
+        for value in (explicit, *(environ.get(name) for name in names)):
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return default
 
-    effort = pick(reasoning_effort, "OPENAI_TRIAGE_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
+    effort = pick(
+        reasoning_effort, ("TRIAGE_REASONING_EFFORT", "OPENAI_TRIAGE_REASONING_EFFORT"), DEFAULT_REASONING_EFFORT,
+    )
     if effort not in REASONING_EFFORTS:
         raise TriageError(
             KIND_CONFIG, f"Недопустимый reasoning effort {effort!r} (ожидается одно из {REASONING_EFFORTS})",
         )
     return {
-        "api_key": pick(None, "OPENAI_API_KEY", None),
-        "model": pick(model, "OPENAI_MODEL", DEFAULT_MODEL),
+        "api_key": pick(None, ("OPENAI_API_KEY",), None),
+        "model": pick(model, ("TRIAGE_MODEL", "OPENAI_MODEL"), DEFAULT_MODEL),
         "reasoning_effort": effort,
     }
 
@@ -171,6 +174,8 @@ def _usage_dict(response) -> dict | None:
         "output_tokens": getattr(usage, "output_tokens", None),
         "total_tokens": getattr(usage, "total_tokens", None),
         "cached_tokens": getattr(input_details, "cached_tokens", None),
+        # Responses API: input_tokens_details.cache_write_tokens; поле может отсутствовать -> 0.
+        "cache_write_tokens": getattr(input_details, "cache_write_tokens", None) or 0,
         "reasoning_tokens": getattr(output_details, "reasoning_tokens", None),
     }
 

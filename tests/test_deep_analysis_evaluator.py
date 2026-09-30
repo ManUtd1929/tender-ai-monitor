@@ -8,9 +8,13 @@ accuracy", только правильная работа evaluator'а (hydrate/
     python -m unittest tests.test_deep_analysis_evaluator -v
 """
 
+import hashlib
 import io
 import json
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 from contextlib import redirect_stdout
 from unittest import mock
 
@@ -22,6 +26,10 @@ from tests.test_evaluation_dataset import make_enrichment
 from tests.test_golden_set import GoldenSetDbTestCase, make_expected
 
 API_KEY = "sk-test-secret-key-123"
+
+
+def _sha256(path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 USAGE = {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500, "cached_tokens": 0, "reasoning_tokens": 200}
 
@@ -254,7 +262,7 @@ class DryRunTests(EvaluatorTestCase):
 
         self.assertEqual(code, 0, output)
         self.assertIn("3 кейс(ов)", output)
-        self.assertIn("gpt-5.6-terra", output)
+        self.assertIn("gpt-5.6-luna", output)
         self.assertIn("high", output)
         self.assertIn("готовых к deep analysis", output)
         self.assertIn("API-вызовов не выполнено", output)
@@ -318,6 +326,12 @@ class CliRunTests(EvaluatorTestCase):
         self.assertEqual(artifact["reasoning_effort"], "high")
         self.assertEqual(artifact["case"]["case_id"], cases[0]["case_id"])
         self.assertEqual(artifact["case"]["status"], "scored")
+        # legacy fake usage без cache_write_tokens -> 0; usage/cost единообразно на верхнем уровне
+        self.assertEqual(artifact["usage"]["cache_write_tokens"], 0)
+        self.assertEqual(artifact["usage"]["input_tokens"], 1000)
+        # у fake-model нет цены: стоимость не выдумывается (None + причина), evaluator не падает
+        self.assertIsNone(artifact["cost"]["estimated_cost_usd"])
+        self.assertIn("fake-model", artifact["cost"]["error"])
 
     def test_unknown_case_id_makes_no_calls(self):
         self.make_golden(RELEVANT)
@@ -365,6 +379,46 @@ class CliRunTests(EvaluatorTestCase):
             evaluator.save_artifact(artifact, self.deep_runs_dir)
 
 
+class MaterializedArtifactTests(EvaluatorTestCase):
+    """Реальный OpenAIDeepAnalysisAnalyzer с fake client: artifact хранит materialized evidence."""
+
+    def run_with_ids(self, evidence_ids):
+        from tests.test_openai_deep_analysis import FakeClient, make_response, payload
+
+        (case,) = self.make_golden(RELEVANT)
+        raw = payload(evidence_ids=evidence_ids, procurement=procurement_block(), category="computer_equipment")
+        client = FakeClient(make_response(raw))
+        analyzer = openai_deep_analysis.OpenAIDeepAnalysisAnalyzer(client=client, environ={}, sleep=lambda _: None)
+        code, output = self.run_main("--case-id", case["case_id"], analyzer=analyzer)
+        return code, output, client, raw
+
+    def test_artifact_contains_materialized_exact_evidence_and_raw_ids(self):
+        code, output, client, raw = self.run_with_ids(["ev_ann_title_0"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(client.responses.calls), 1)
+        (path,) = self.deep_runs_dir.glob("*.json")
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+        case = artifact["case"]
+        self.assertEqual(artifact["prompt_version"], "procurement-deep-v5")
+        (evidence,) = case["prediction"]["evidence"]
+        self.assertEqual(evidence["evidence_id"], "ev_ann_title_0")
+        self.assertEqual(evidence["source_type"], "announcement")
+        self.assertTrue(evidence["text"])  # точный заголовок тендера, взятый из каталога
+        self.assertEqual(case["raw_model_output"]["evidence_ids"], ["ev_ann_title_0"])
+        self.assertNotIn("evidence", case["raw_model_output"])
+        self.assertGreater(case["evidence_units"], 0)
+        self.assertNotIn("evidence_catalog", json.dumps(artifact))
+
+    def test_unknown_id_is_recorded_as_validation_error(self):
+        code, output, _, _ = self.run_with_ids(["ev_doc_1_ffffff_0000"])
+        self.assertEqual(code, 1)
+        (path,) = self.deep_runs_dir.glob("*.json")
+        case = json.loads(path.read_text(encoding="utf-8"))["case"]
+        self.assertEqual(case["status"], evaluator.RECORD_ERROR)
+        self.assertEqual(case["error"]["kind"], "validation")
+        self.assertIsNone(case["prediction"])
+
+
 class SafetyTests(unittest.TestCase):
     def test_production_db_stays_blocked(self):
         case = {
@@ -374,13 +428,65 @@ class SafetyTests(unittest.TestCase):
         with safety_guards.expect_violation(self, safety_guards.DATABASE_MESSAGE):
             evaluator.prepare_case(case, db_path=safety_guards.PRODUCTION_DB_PATH)
 
-    def test_dry_run_does_not_mutate_production_db_or_golden_set(self):
-        # dry-run на реальном golden set обязан оставаться read-only даже при ошибке БД.
-        with self.assertRaises((AssertionError, Exception)):
-            evaluator.main(
-                ["--dry-run", "--db-path", str(safety_guards.PRODUCTION_DB_PATH)],
-                analyzer=openai_deep_analysis.OpenAIDeepAnalysisAnalyzer(environ={"OPENAI_API_KEY": API_KEY}),
-            )
+    @unittest.skipUnless(safety_guards.PRODUCTION_DB_PATH.exists(), "нет локальной production БД для копирования")
+    def test_dry_run_on_real_golden_set_and_db_copy_reaches_read_path_and_mutates_nothing(self):
+        """
+        Настоящий golden set + КОПИЯ production БД (файловое копирование, sqlite к оригиналу не
+        подключается: это запрещено защитой тестов). Проверяем, что dry-run дошёл до конца (hydrate
+        по БД + итоговая строка), а не упал раньше на выводе армянского текста в кодировку консоли.
+        """
+        golden_path = golden_set.DEFAULT_GOLDEN_SET_PATH
+        self.assertTrue(golden_path.exists(), "в репозитории должен быть golden set")
+        with tempfile.TemporaryDirectory() as tmp:
+            db_copy = Path(tmp) / "tenders_copy.db"
+            shutil.copyfile(safety_guards.PRODUCTION_DB_PATH, db_copy)
+            hashes_before = {
+                "production_db": _sha256(safety_guards.PRODUCTION_DB_PATH),
+                "db_copy": _sha256(db_copy),
+                "golden_set": _sha256(golden_path),
+            }
+            violations_before = safety_guards.violations()
+            analyzer = openai_deep_analysis.OpenAIDeepAnalysisAnalyzer(environ={"OPENAI_API_KEY": API_KEY})
+            # UTF-8, а не консольная cp1252: армянский текст не должен ронять вывод.
+            raw = io.BytesIO()
+            stdout = io.TextIOWrapper(raw, encoding="utf-8", write_through=True)
+            with mock.patch.object(analyzer, "ensure_client", side_effect=AssertionError("client created")),                     mock.patch("openai.OpenAI", side_effect=AssertionError("OpenAI client created")),                     redirect_stdout(stdout):
+                code = evaluator.main(["--dry-run", "--db-path", str(db_copy)], analyzer=analyzer)
+            output = raw.getvalue().decode("utf-8")
+
+            self.assertEqual(code, 0, output)
+            # дошли до конца: golden set прочитан, БД прочитана (hydrate), конфиг проверен, итог напечатан
+            self.assertIn("кейс(ов), структура валидна", output)
+            self.assertIn("Hydrate/hash/eligibility:", output)
+            self.assertIn("API-вызовов не выполнено, client не создавался", output)
+            self.assertNotIn(API_KEY, output)
+            self.assertEqual({
+                "production_db": _sha256(safety_guards.PRODUCTION_DB_PATH),
+                "db_copy": _sha256(db_copy),
+                "golden_set": _sha256(golden_path),
+            }, hashes_before)
+            # ни сети, ни production БД: список нарушений защиты не вырос
+            self.assertEqual(safety_guards.violations(), violations_before)
+
+    def test_dry_run_survives_non_ascii_output_and_reaches_db(self):
+        """Hermetic-вариант: армянский заголовок в golden set, вывод в UTF-8, БД (пустая, временная) читается."""
+        with tempfile.TemporaryDirectory() as tmp:
+            case = golden_set.load_golden_set(golden_set.DEFAULT_GOLDEN_SET_PATH)[0]
+            case["title"] = "Համակարգիչների մատակարարում"
+            path = Path(tmp) / "golden.json"
+            path.write_text(json.dumps([case], ensure_ascii=False), encoding="utf-8")
+            raw = io.BytesIO()
+            stdout = io.TextIOWrapper(raw, encoding="utf-8", write_through=True)
+            analyzer = openai_deep_analysis.OpenAIDeepAnalysisAnalyzer(environ={"OPENAI_API_KEY": API_KEY})
+            missing_db = Path(tmp) / "empty.db"
+            with redirect_stdout(stdout):
+                code = evaluator.main(
+                    ["--dry-run", "--path", str(path), "--db-path", str(missing_db)], analyzer=analyzer,
+                )
+            output = raw.getvalue().decode("utf-8")
+            self.assertIn("Hydrate/hash/eligibility:", output, output)
+            self.assertIn("API-вызовов не выполнено", output)
+            self.assertIn(code, (0, 1))
 
     def test_no_all_mode_in_arg_parser(self):
         parser = evaluator._build_arg_parser()

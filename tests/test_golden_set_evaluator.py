@@ -310,7 +310,7 @@ class DryRunTests(EvaluatorTestCase):
         self.assertEqual(client.responses.calls, [])
         self.assertIn("2 кейс(ов)", output)
         self.assertIn("'ok': 2", output)
-        self.assertIn("gpt-5.6-terra", output)
+        self.assertIn("gpt-5.6-luna", output)
         self.assertIn("medium", output)
         self.assertIn("API-вызовов не выполнено", output)
         self.assertNotIn(API_KEY, output)
@@ -372,6 +372,8 @@ class CliRunTests(EvaluatorTestCase):
         artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
         self.assertEqual(artifact["evaluator_version"], evaluator.EVALUATOR_VERSION)
         self.assertEqual(artifact["prompt_version"], "test-prompt")
+        self.assertEqual(artifact["usage"]["cache_write_tokens"], 0)
+        self.assertEqual(artifact["metrics"]["usage_totals"]["cache_write_tokens"], 0)
         self.assertEqual(artifact["model"], "fake-model")
         self.assertEqual(artifact["reasoning_effort"], "medium")
         self.assertEqual(artifact["mode"], "case")
@@ -453,7 +455,7 @@ class CliRunTests(EvaluatorTestCase):
         (artifact_path,) = list(self.runs_dir.iterdir())
         self.assertNotIn(API_KEY, artifact_path.read_text(encoding="utf-8"))
         self.assertNotIn(API_KEY, output)
-        self.assertIn("gpt-5.6-terra", artifact_path.name)
+        self.assertIn("gpt-5.6-luna", artifact_path.name)
 
     def test_artifact_is_not_overwritten(self):
         cases = self.make_golden(RELEVANT)

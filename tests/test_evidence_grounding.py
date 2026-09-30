@@ -293,6 +293,60 @@ class DeepDocumentEvidenceTests(unittest.TestCase):
     def test_document_without_chunks_cannot_be_quoted(self):
         self.assertRejected(deep_document_item("x", download_id=8, member_name="notes.docx"), contains="chunks")
 
+    # --- shortest-sufficient-evidence regression (Luna tires case: model glued a continuation) ---
+
+    SECURITY_CLAUSE = (
+        "10.3 Размер обеспечения договора составляет 10 процентов от цены закупки. "
+        "Если цена закупки товара меньше цены заключаемого договора, то размер обеспечения "
+        "договора исчисляется в отношении цены договора."
+    )
+    SHORT_SECURITY_QUOTE = "Размер обеспечения договора составляет 10 процентов от цены закупки."
+
+    def _security_context(self, text):
+        context = dict(DEEP_CONTEXT)
+        context["chunks"] = [
+            {"chunk_id": "7:spec.docx:0", "download_id": 7, "member_name": "spec.docx",
+             "file_type": "docx", "text": text},
+        ]
+        return context
+
+    def assertSecurityRejected(self, quote, source):
+        with self.assertRaises(ValueError) as context:
+            evidence_grounding.validate_deep_evidence_grounding(
+                [deep_document_item(quote)], self._security_context(source),
+            )
+        self.assertIn("дословным", str(context.exception))
+
+    def test_short_exact_evidence_passes(self):
+        source = self.SECURITY_CLAUSE
+        evidence_grounding.validate_deep_evidence_grounding(
+            [deep_document_item(self.SHORT_SECURITY_QUOTE)], self._security_context(source),
+        )
+
+    def test_model_added_continuation_fails(self):
+        # Источник кончается на первом предложении; вторую половину модель дописала сама.
+        source = "10.3 Размер обеспечения договора составляет 10 процентов от цены закупки. Иное не установлено."
+        self.assertSecurityRejected(self.SECURITY_CLAUSE, source)
+
+    def test_concatenation_of_non_contiguous_fragments_fails(self):
+        source = (
+            "10.3 Размер обеспечения договора составляет 10 процентов от цены закупки. "
+            "10.4 Обеспечение возвращается в течение 10 дней. "
+            "Если цена закупки товара меньше цены заключаемого договора, то размер обеспечения "
+            "договора исчисляется в отношении цены договора."
+        )
+        self.assertSecurityRejected(self.SECURITY_CLAUSE, source)
+
+    def test_paraphrase_of_security_clause_fails(self):
+        self.assertSecurityRejected(
+            "Обеспечение договора равно 10% от цены закупки.", self.SECURITY_CLAUSE,
+        )
+
+    def test_translation_of_security_clause_fails(self):
+        self.assertSecurityRejected(
+            "The contract security amount is 10 percent of the procurement price.", self.SECURITY_CLAUSE,
+        )
+
     def test_announcement_and_enrichment_evidence_reused_unchanged(self):
         self.assertGrounded(
             item(text=DEEP_CONTEXT["title"]),

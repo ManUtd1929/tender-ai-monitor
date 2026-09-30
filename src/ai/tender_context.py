@@ -318,26 +318,73 @@ def build_deep_analysis_context(tender_context: dict, chunk_size: int = DEFAULT_
     Только chunking — semantic embeddings/vector DB и LLM map/reduce здесь нет.
     tender_context не изменяется.
     """
+    documents_with_text = [
+        document for document in tender_context["documents"]
+        if document["extraction_status"] == "success" and (document.get("text") or "")
+    ]
+
+    # Exact content dedup: sha256 от точного extracted text (без fuzzy/semantic сравнения,
+    # имена файлов в identity не участвуют). Canonical source группы — минимальный
+    # (str(download_id), member_name): не зависит от порядка documents.
+    groups_by_hash = {}
+    for document in documents_with_text:
+        content_hash = hashlib.sha256(document["text"].encode("utf-8")).hexdigest()
+        groups_by_hash.setdefault(content_hash, []).append(document)
+
+    def _source_key(document: dict) -> tuple:
+        return (str(document["download_id"]), str(document["member_name"]))
+
+    canonical_by_hash = {
+        content_hash: min(group, key=_source_key) for content_hash, group in groups_by_hash.items()
+    }
+    group_id_by_hash = {content_hash: f"content-{content_hash[:16]}" for content_hash in groups_by_hash}
+
     chunks = []
-    for document in tender_context["documents"]:
-        if document["extraction_status"] != "success":
+    for document in documents_with_text:
+        content_hash = hashlib.sha256(document["text"].encode("utf-8")).hexdigest()
+        if canonical_by_hash[content_hash] is not document:
             continue
-        text = document.get("text") or ""
-        if not text:
-            continue
-        for index, piece in enumerate(_chunk_text(text, chunk_size)):
+        for index, piece in enumerate(_chunk_text(document["text"], chunk_size)):
             chunks.append({
                 "chunk_id": f"{document['download_id']}:{document['member_name']}:{index}",
+                "content_group_id": group_id_by_hash[content_hash],
                 "download_id": document["download_id"],
                 "member_name": document["member_name"],
                 "file_type": document["file_type"],
                 "text": piece,
             })
 
+    content_groups = []
+    for content_hash in sorted(groups_by_hash, key=lambda h: _source_key(canonical_by_hash[h])):
+        canonical = canonical_by_hash[content_hash]
+        content_groups.append({
+            "content_group_id": group_id_by_hash[content_hash],
+            "content_sha256": content_hash,
+            "canonical_source": {
+                "download_id": canonical["download_id"],
+                "member_name": canonical["member_name"],
+                "file_type": canonical["file_type"],
+            },
+            "represented_sources": [
+                {
+                    "download_id": document["download_id"],
+                    "member_name": document["member_name"],
+                    "file_type": document["file_type"],
+                }
+                for document in sorted(groups_by_hash[content_hash], key=_source_key)
+            ],
+        })
+
     return {
         "resource_url": tender_context["resource_url"],
         "chunk_size": chunk_size,
         "chunks": chunks,
+        "content_groups": content_groups,
+        "document_content_stats": {
+            "total_documents_with_text": len(documents_with_text),
+            "unique_content_groups": len(content_groups),
+            "duplicate_documents": len(documents_with_text) - len(content_groups),
+        },
     }
 
 

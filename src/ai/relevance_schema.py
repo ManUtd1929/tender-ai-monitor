@@ -85,7 +85,12 @@ SOURCE_CONFLICT_FIELDS = ("sources", "conflict_description", "impact")
 
 # Одна позиция (товар) в рамках procurement lot(s). item_name обязателен — остальное null,
 # если не удалось извлечь (правило проекта №1: не выдумывать quantity/unit).
-PROCUREMENT_ITEM_FIELDS = ("item_name", "lot_number", "quantity", "unit", "key_specifications", "evidence")
+PROCUREMENT_ITEM_FIELDS = (
+    "item_name", "lot_number", "quantity", "unit", "key_specifications", "brand_or_equivalent", "evidence",
+)
+# Backward compatibility: результаты, сохранённые до появления item.brand_or_equivalent, не имеют
+# этого ключа — validator принимает их (трактует как null). Новый strict schema требует ключ.
+PROCUREMENT_ITEM_OPTIONAL_FIELDS = ("brand_or_equivalent",)
 
 # Структурированная сводка по одному лоту (для тендеров с десятками/сотнями лотов — без
 # необходимости перечислять каждую позицию, см. deep analysis правило №3).
@@ -302,6 +307,28 @@ def validate_evidence_list(evidence, what: str) -> list:
     return [validate_evidence_item(item) for item in evidence]
 
 
+# DEEP-only (procurement-deep-v4): материализованный evidence содержит ещё evidence_id — ID
+# unit'а evidence catalog (src.ai.evidence_catalog). Старые deep-артефакты и triage evidence
+# (без evidence_id) остаются валидными; validate_evidence_item / triage не меняются.
+DEEP_EVIDENCE_ID_FIELD = "evidence_id"
+
+
+def validate_deep_evidence_item(item: dict) -> dict:
+    """validate_evidence_item + необязательный evidence_id (непустая строка). Новый dict."""
+    item = _require_dict(item, "evidence item")
+    if DEEP_EVIDENCE_ID_FIELD not in item:
+        return validate_evidence_item(item)
+    base = {key: value for key, value in item.items() if key != DEEP_EVIDENCE_ID_FIELD}
+    evidence_id = _require_nonblank_str(item[DEEP_EVIDENCE_ID_FIELD], DEEP_EVIDENCE_ID_FIELD, "evidence item")
+    return {DEEP_EVIDENCE_ID_FIELD: evidence_id, **validate_evidence_item(base)}
+
+
+def validate_deep_evidence_list(evidence, what: str) -> list:
+    if not isinstance(evidence, list):
+        raise ValueError(f"{what}.evidence должен быть list: {evidence!r}")
+    return [validate_deep_evidence_item(item) for item in evidence]
+
+
 def validate_participation_barrier(item: dict) -> dict:
     """
     Один participation barrier: type (PARTICIPATION_BARRIER_TYPES), description (непустая
@@ -315,7 +342,7 @@ def validate_participation_barrier(item: dict) -> dict:
     barrier_type = _require_enum(item["type"], PARTICIPATION_BARRIER_TYPES, "type", "participation barrier")
     description = _require_nonblank_str(item["description"], "description", "participation barrier")
     severity = _require_enum(item["severity"], CONFIDENCE_LEVELS, "severity", "participation barrier")
-    evidence = validate_evidence_list(item["evidence"], "participation barrier")
+    evidence = validate_deep_evidence_list(item["evidence"], "participation barrier")
     if not evidence:
         raise ValueError(
             "participation barrier: evidence не может быть пустым (правило проекта №1: "
@@ -435,14 +462,18 @@ def validate_procurement_item(item: dict) -> dict:
     пустым); evidence обязательно непустой (позиция не может быть заявлена без цитаты).
     """
     item = _require_dict(item, "procurement item")
-    _require_exact_keys(item, PROCUREMENT_ITEM_FIELDS, "procurement item")
+    required_item_fields = tuple(f for f in PROCUREMENT_ITEM_FIELDS if f not in PROCUREMENT_ITEM_OPTIONAL_FIELDS)
+    _require_exact_keys(
+        item, PROCUREMENT_ITEM_FIELDS if "brand_or_equivalent" in item else required_item_fields,
+        "procurement item",
+    )
 
     item_name = _require_nonblank_str(item["item_name"], "item_name", "procurement item")
     lot_number = _optional_str(item["lot_number"], "lot_number", "procurement item")
     quantity = _optional_str(item["quantity"], "quantity", "procurement item")
     unit = _optional_str(item["unit"], "unit", "procurement item")
     key_specifications = _str_list(item["key_specifications"], "key_specifications", "procurement item")
-    evidence = validate_evidence_list(item["evidence"], "procurement item")
+    evidence = validate_deep_evidence_list(item["evidence"], "procurement item")
     if not evidence:
         raise ValueError(
             "procurement item: evidence не может быть пустым (позиция не может быть "
@@ -455,6 +486,7 @@ def validate_procurement_item(item: dict) -> dict:
         "quantity": quantity,
         "unit": unit,
         "key_specifications": key_specifications,
+        "brand_or_equivalent": validate_brand_or_equivalent(item.get("brand_or_equivalent")),
         "evidence": evidence,
     }
 
@@ -473,7 +505,7 @@ def validate_procurement_lot(lot: dict) -> dict:
     lot_number = _require_nonblank_str(lot["lot_number"], "lot_number", "procurement lot")
     description = _optional_str(lot["description"], "description", "procurement lot")
     item_count = _optional_nonneg_int(lot["item_count"], "item_count", "procurement lot")
-    evidence = validate_evidence_list(lot["evidence"], "procurement lot")
+    evidence = validate_deep_evidence_list(lot["evidence"], "procurement lot")
 
     return {
         "lot_number": lot_number,
@@ -574,7 +606,7 @@ def validate_deep_analysis_result(result: dict) -> dict:
     manual_review_required = _require_bool(
         result["manual_review_required"], "manual_review_required", "deep analysis result"
     )
-    evidence = validate_evidence_list(result["evidence"], "deep analysis result")
+    evidence = validate_deep_evidence_list(result["evidence"], "deep analysis result")
 
     procurement = _validate_optional_block(
         result["procurement"], validate_procurement_block, "procurement", "deep analysis result"

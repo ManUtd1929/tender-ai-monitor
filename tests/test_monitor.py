@@ -228,6 +228,47 @@ class RunMonitorTest(unittest.TestCase):
         candidates = self.process_announcements.call_args.args[0]
         return [a["resource_url"] for a in candidates]
 
+    def run_with_ai_env(self, value):
+        env = {} if value is None else {"AI_ANALYSIS_ENABLED": value}
+        return mock.patch.dict("os.environ", env, clear=True)
+
+    def test_ai_analysis_disabled_by_default_makes_no_ai_calls(self):
+        from src.ai import analysis_pipeline
+
+        for value in (None, "", "false", "0"):
+            with self.subTest(value=value), self.run_with_ai_env(value),                  mock.patch.object(analysis_pipeline, "run_ai_analysis") as run_ai,                  mock.patch.object(analysis_pipeline, "build_analyzers") as build,                  mock.patch("openai.OpenAI") as client:
+                result = monitor.run_monitor()
+
+            self.assertIsNone(result["ai_analysis"])
+            run_ai.assert_not_called()
+            build.assert_not_called()
+            client.assert_not_called()
+
+    def test_ai_analysis_enabled_runs_pipeline_after_documents(self):
+        from src.ai import analysis_pipeline
+
+        order = []
+        self.process_documents.side_effect = lambda candidates: order.append("documents") or make_document_result()
+        with self.run_with_ai_env("true"), mock.patch.object(
+            analysis_pipeline, "run_ai_analysis", side_effect=lambda: order.append("ai") or {"processed_count": 0},
+        ):
+            result = monitor.run_monitor()
+
+        self.assertEqual(order, ["documents", "ai"])
+        self.assertEqual(result["ai_analysis"], {"processed_count": 0})
+
+    def test_ai_analysis_error_does_not_abort_monitor(self):
+        from src.ai import analysis_pipeline
+
+        with self.run_with_ai_env("true"), mock.patch.object(
+            analysis_pipeline, "run_ai_analysis", side_effect=RuntimeError("boom"),
+        ):
+            result = monitor.run_monitor()
+
+        self.assertEqual(result["ai_analysis"]["status"], "error")
+        self.assertEqual(result["ai_analysis"]["error_type"], "RuntimeError")
+        self.assertEqual(result["fetched_count"], 0)
+
     def test_counts_fetched_unique_and_duplicates(self):
         self.fetch_all_sections.return_value = [make_announcement(1), make_announcement(2), make_announcement(3)]
 

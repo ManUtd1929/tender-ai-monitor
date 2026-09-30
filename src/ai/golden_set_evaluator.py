@@ -19,6 +19,15 @@ CLI:
     python -m src.ai.golden_set_evaluator --dry-run
     python -m src.ai.golden_set_evaluator --case-id <CASE_ID>
     python -m src.ai.golden_set_evaluator --all
+    python -m src.ai.golden_set_evaluator --all --model gpt-5.6-luna     # benchmark другой модели
+
+Benchmark другой модели (например Luna) идёт через тот же prompt (procurement-v2), ту же
+Structured Outputs схему, grounding, retry и golden set — apples-to-apples, без model-specific
+правил. Artifact хранит model, prompt_version, reasoning_effort, metrics, usage и
+оценку стоимости USD по src.ai.pricing (pricing_version). Критерии допуска модели к production
+triage (см. production_criteria): relevance_status 24/24, core 24/24, false negatives 0,
+false positives 0, API/validation errors 0; category accuracy вторична. Если модель не проходит
+core — production triage остаётся на Terra до отдельного разбора. Ledger evaluator не пишет.
 """
 
 import argparse
@@ -28,11 +37,15 @@ import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 from src.ai import golden_set
 from src.ai import openai_triage
+from src.ai import preflight
+from src.ai import pricing
 from src.ai import triage_prompt
+from src.ai.budget_settings import BudgetSettings
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +265,8 @@ def compute_metrics(records: list) -> dict:
         if record["error"] is not None:
             error_kinds[record["error"]["kind"]] = error_kinds.get(record["error"]["kind"], 0) + 1
 
-    usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0}
+    usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0,
+                    "cache_write_tokens": 0}
     for record in records:
         for name in usage_totals:
             usage_totals[name] += (record["usage"] or {}).get(name) or 0
@@ -282,7 +296,43 @@ def _timestamp_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def cost_summary(model, records: list, pricing_overrides=None) -> dict:
+    """
+    {pricing_version, estimated_cost_usd (str Decimal | None), error}: сумма cost_from_usage по
+    записям с usage (включая ошибочные, если провайдер вернул usage). Модель без цены не роняет
+    evaluator: cost=None и текст ошибки; стоимость не выдумывается.
+    """
+    summary = {"pricing_version": pricing.PRICING_VERSION, "estimated_cost_usd": None, "error": None}
+    total = Decimal(0)
+    try:
+        for record in records:
+            if record["usage"]:
+                total += pricing.cost_from_usage(model, record["usage"], pricing_overrides)
+    except pricing.CostEstimationError as error:
+        summary["error"] = str(error)
+        return summary
+    summary["estimated_cost_usd"] = str(total)
+    return summary
+
+
+def production_criteria(metrics: dict) -> dict:
+    """
+    Критерии допуска модели к production triage (документируют решение, не подсказывают модели
+    ответы): {checks: {name: bool}, passed: bool}. Категория вторична и в допуск не входит.
+    """
+    total = metrics["total_cases"]
+    checks = {
+        "relevance_status_all_correct": metrics["relevance_status"]["correct"] == total == metrics["scored_cases"],
+        "core_all_correct": metrics["core"]["correct"] == total == metrics["scored_cases"],
+        "false_negatives_zero": not metrics["mismatches"][MISMATCH_FALSE_NEGATIVE],
+        "false_positives_zero": not metrics["mismatches"][MISMATCH_FALSE_POSITIVE],
+        "api_validation_errors_zero": metrics["error_cases"] == 0 and metrics["skipped_cases"] == 0,
+    }
+    return {"checks": checks, "passed": all(checks.values())}
+
+
 def build_artifact(records: list, analyzer, mode: str, golden_path, started_at: datetime) -> dict:
+    metrics = compute_metrics(records)
     return {
         "evaluator_version": EVALUATOR_VERSION,
         "prompt_version": getattr(analyzer, "prompt_version", None),
@@ -292,7 +342,10 @@ def build_artifact(records: list, analyzer, mode: str, golden_path, started_at: 
         "timestamp": started_at.isoformat(),
         "mode": mode,
         "golden_set": Path(golden_path).name,
-        "metrics": compute_metrics(records),
+        "metrics": metrics,
+        "usage": pricing.normalize_usage(metrics["usage_totals"]),
+        "cost": cost_summary(getattr(analyzer, "model", None), records),
+        "production_criteria": production_criteria(metrics),
         "cases": records,
     }
 
@@ -389,6 +442,16 @@ def _format_failure(record: dict) -> str:
     )
 
 
+def format_cost_and_criteria(artifact: dict) -> str:
+    cost = artifact["cost"]
+    cost_text = f"${cost['estimated_cost_usd']}" if cost["estimated_cost_usd"] is not None else f"н/д ({cost['error']})"
+    lines = [f"Оценка стоимости прогона (pricing {cost['pricing_version']}): {cost_text}", "Критерии допуска к production triage:"]
+    for name, ok in artifact["production_criteria"]["checks"].items():
+        lines.append(f"  {_pass_fail(ok)}  {name}")
+    lines.append("  ИТОГ: " + ("модель проходит критерии" if artifact["production_criteria"]["passed"] else "НЕ проходит критерии"))
+    return "\n".join(lines)
+
+
 def format_report(records: list, metrics: dict) -> str:
     lines = [
         "=" * 72,
@@ -474,12 +537,33 @@ def _default_analyzer(args) -> openai_triage.OpenAITriageAnalyzer:
     return openai_triage.OpenAITriageAnalyzer(model=args.model, reasoning_effort=args.reasoning_effort)
 
 
+def _print_cost_preflight(triage_contexts: list, analyzer) -> None:
+    """Консервативная верхняя оценка стоимости полного прогона (эвристика preflight, не точный подсчёт)."""
+    if not triage_contexts:
+        return
+    try:
+        total = sum(
+            (preflight.preflight_request(
+                analyzer.build_request(context), analyzer.model, "triage", BudgetSettings(),
+            )["estimated_cost_usd"] for context in triage_contexts),
+            Decimal(0),
+        )
+    except pricing.CostEstimationError as error:
+        print(f"Оценка стоимости недоступна: {error}")
+        return
+    print(
+        f"Консервативная оценка стоимости прогона {len(triage_contexts)} кейс(ов) на {analyzer.model} "
+        f"(верхняя граница, pricing {pricing.PRICING_VERSION}): ${total.quantize(Decimal('0.0001'))}"
+    )
+
+
 def _dry_run(cases: list, analyzer, args) -> int:
     print(f"Golden set: {args.path} — {len(cases)} кейс(ов), структура валидна")
 
     counts: dict = {}
     problems = []
     request_sizes = []
+    triage_contexts = []
     for case in cases:
         prepared = prepare_case(case, db_path=args.db_path)
         counts[prepared["status"]] = counts.get(prepared["status"], 0) + 1
@@ -487,6 +571,7 @@ def _dry_run(cases: list, analyzer, args) -> int:
             problems.append(f"  {prepared['status'].upper():8} {case['case_id']}  {prepared['detail']}")
         else:
             request_sizes.append(len(triage_prompt.build_user_input(prepared["triage_context"])))
+            triage_contexts.append(prepared["triage_context"])
     print(f"Hydrate/hash: { {name: counts.get(name, 0) for name in ('ok', 'stale', 'missing', 'error')} }")
     for line in problems:
         print(line)
@@ -500,6 +585,7 @@ def _dry_run(cases: list, analyzer, args) -> int:
     config_ok = analyzer.has_api_key
     if not config_ok:
         print("  ПРОБЛЕМА: OPENAI_API_KEY не задан (env или .env) — реальный запуск невозможен")
+    _print_cost_preflight(triage_contexts, analyzer)
     print("DRY RUN: API-вызовов не выполнено, client не создавался")
     return 0 if not problems and config_ok else 1
 
@@ -555,6 +641,7 @@ def main(argv=None, analyzer=None) -> int:
         print(format_case_detail(records[0], selected[0]))
     artifact = build_artifact(records, analyzer, mode, args.path, started_at)
     print(format_report(records, artifact["metrics"]))
+    print(format_cost_and_criteria(artifact))
     print(f"\nRun artifact: {save_artifact(artifact, args.runs_dir)}")
 
     metrics = artifact["metrics"]

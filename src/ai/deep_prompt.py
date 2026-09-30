@@ -14,10 +14,15 @@ relevance). Никакого embeddings/vector search и никакого multi-
 единственный запрос на весь доступный context (правило задачи: "простейшая корректная
 архитектура", "не придумывай silent truncation").
 
-Grounding evidence для document quotes проверяется по восстановленному из chunks полному
-тексту (src.ai.evidence_grounding.validate_deep_evidence_grounding), а не по chunk-фрагменту
-напрямую — так quote не рвётся на границе chunk'а. field для document evidence — фиксированная
-строка DEEP_DOCUMENT_EVIDENCE_FIELD ("text"), независимо от количества chunks у документа.
+procurement-deep-v4/v5: модель НЕ воспроизводит цитаты. Текст источника (announcement/enrichment
+поля + текст документов) превращается в детерминированный evidence catalog
+(src.ai.evidence_catalog) и показывается модели как EVIDENCE_CATALOG с ID; модель возвращает
+только evidence_ids, а Python материализует evidence.text из каталога. chunks в DEEP_CONTEXT
+больше не отправляются — их текст живёт в каталоге (один раз, с exact-content dedup).
+
+procurement-deep-v5: тот же evidence-ID контракт, что и v4; изменена только семантика типов
+participation barrier (financial_requirement / bid_security / contract_security различаются
+по тому, ЧТО именно обеспечивается — это смысл для модели, а не постобработка ответа по ключевым словам).
 
 Procurement-only MVP: opportunity_type модели ограничен DEEP_MVP_OPPORTUNITY_TYPES
 ("procurement", "unclear") — deep analysis запускается только для triage relevant+procurement
@@ -29,9 +34,9 @@ analysis_repository.get_deep_analysis_candidates), logistics сюда не по�
 
 import json
 
-from src.ai import evidence_grounding, relevance_schema, triage_prompt
+from src.ai import evidence_catalog, evidence_grounding, relevance_schema, triage_prompt
 
-DEEP_PROMPT_VERSION = "procurement-deep-v1"
+DEEP_PROMPT_VERSION = "procurement-deep-v5"
 
 DEEP_OUTPUT_NAME = "tender_deep_analysis"
 
@@ -62,20 +67,33 @@ estimated contract value, extract it as a fact (procurement.estimated_value_amd)
 compute or infer a value yourself.
 
 INPUT (DEEP_CONTEXT, JSON)
-- Announcement/enrichment fields (title, section, resource_type, published_at, deadline_at,
-  detail_titles, description, procurement_type, procedure_type, contracting_authority,
-  estimated_value_amd, dates, cpv_codes, number_of_lots): the same Python-derived facts
-  triage saw, without truncation.
+- number_of_lots and the tender-level Python-derived facts. The announcement/enrichment text
+  fields (title, section, resource_type, published_at, deadline_at, detail_titles, description,
+  procurement_type, procedure_type, contracting_authority, estimated_value_amd, dates,
+  cpv_codes) and the extracted document texts are NOT repeated in DEEP_CONTEXT: they are the
+  units of EVIDENCE_CATALOG (see below), without truncation.
 - document_coverage: Python-computed fact about how much of the tender documentation was
   successfully extracted (successful/failed/skipped extractions, unsupported extensions,
   coverage_complete). This is ground truth about what is missing, not your judgement.
 - documents: metadata of every document known for this tender (download_id, member_name,
   file_type, extraction_status).
-- chunks: the full extracted text of every successfully processed document, split
-  deterministically into ordered pieces (chunk_id, download_id, member_name, file_type,
-  text). Multiple chunks can belong to the same document; read them in order to reconstruct
-  its full content. A document with no chunks was not successfully extracted (see
+- EVIDENCE_CATALOG (after DEEP_CONTEXT): the exact source text, split into evidence units.
+  Each unit is one line "[evidence_id] exact text" (dictionary fields also show "key=<name>"
+  after the ID). "[SOURCE type=... field=... download_id=... member_name=...
+  content_group_id=...]" lines say where the following units come from. Units of one document
+  are in reading order, so consecutive IDs are consecutive lines/rows of that document. A
+  document with no units and not listed in content_groups was not successfully extracted (see
   document_coverage) — never invent its content.
+- content_groups / document_content_stats: documents whose extracted text is byte-for-byte
+  identical are sent ONCE. Each content group has content_group_id, canonical_source (the
+  download_id/member_name whose evidence units carry the text) and represented_sources (ALL documents
+  that contain exactly this text, including the canonical one). If a group has several
+  represented_sources, the same content was found in every one of those documents (e.g. the
+  same table repeated in per-lot files); do not treat it as a single document and do not
+  assume those documents differ. Evidence units exist only for the canonical_source (their
+  content_group_id matches the group); select them for any of the represented documents.
+  document_content_stats counts total_documents_with_text,
+  unique_content_groups and duplicate_documents.
 
 ABSENCE OF EVIDENCE IS NOT EVIDENCE OF ABSENCE
 document_coverage may be incomplete (failed/skipped extractions, unsupported .doc/.xls/.rar
@@ -92,7 +110,7 @@ category: reuse the canonical goods category from DEEP_CONTEXT.triage.category w
   from this list: {goods_categories}. Otherwise keep a concise snake_case label. null only if
   opportunity_type is "unclear".
 why_interesting: 1-2 sentences on why this could fit the business's supply/import model.
-contracting_authority / procedure_code: copy verbatim from context if available; null if not.
+contracting_authority / procedure_code: copy verbatim from the catalog/context if available; null if not.
 confidence: "high"/"medium"/"low" — lower it for thin, ambiguous or conflicting material.
 manual_review_required: true whenever a human must check something before acting (barriers,
   incomplete coverage that could hide a requirement, source conflicts, ambiguous quantities).
@@ -106,17 +124,24 @@ procurement (required when opportunity_type="procurement", must be null for "unc
   (required), lot_number, quantity, unit (null if not stated — never invent a number),
   key_specifications (list of short strings, only requirements actually present: dimensions,
   power, capacity, material, standards, model/compatibility, functional features, packaging,
-  condition, year, completeness, etc. — never "common sense" additions), evidence (required,
-  non-empty: an item cannot be listed without a supporting quote).
+  condition, year, completeness, etc. — never "common sense" additions),
+  brand_or_equivalent (see below; item-specific), evidence_ids (required,
+  non-empty: an item cannot be listed without supporting evidence).
 - lots: when the tender has many lots, do not force everything into one item. Provide a
   lot-level summary instead (lot_number, description, item_count) rather than enumerating every
   lot; procurement.total_lots may record the total count. Do not hide that the procurement is
   heterogeneous across lots.
 - technical_requirements / country_of_origin_requirements / certifications: short strings,
   only requirements that literally appear in the material.
-- brand_or_equivalent: null if no brand/model is mentioned. Otherwise specified_brand is the
+- brand_or_equivalent (two levels, same shape at both):
+  null if no brand/model is mentioned. Otherwise specified_brand is the
   brand/model named; equivalent_allowed is true/false only if the material explicitly states
   whether an equivalent is accepted, otherwise null (unknown) — never guess this.
+  A brand/model (or "or equivalent" wording) that applies to ONE position goes into that
+  item's brand_or_equivalent; procurement.brand_or_equivalent is ONLY for a rule that applies
+  to the whole tender. Never copy one item's brand to the tender level or to other items, and
+  never infer a tender-wide brand rule from a single position. Use null at the tender level
+  when brand rules are item-specific.
 - delivery_location / delivery_deadline / warranty: extract the most specific value present
   (a date, a number of calendar/working days, "N days after signing", a per-lot schedule).
   Never convert a relative deadline into an absolute date yourself.
@@ -124,8 +149,21 @@ procurement (required when opportunity_type="procurement", must be null for "unc
 
 participation_barriers: only barriers the material actually confirms, one of {barrier_types}.
   Each barrier needs: type, description (Russian, what the material actually requires),
-  severity (high/medium/low — how much it could block participation), evidence (required,
+  severity (high/medium/low — how much it could block participation), evidence_ids (required,
   non-empty). A routine, generic procurement-law clause is NOT a tender-specific barrier.
+  Money-related barrier types differ by WHAT the money secures — choose by that meaning, and give
+  each distinct requirement exactly ONE type (do not report the same requirement under several
+  types unless the material really states it as separate requirements):
+    "bid_security": security for the bid/application itself (bid security, tender guarantee).
+    "contract_security": security for performance of the concluded contract (performance
+      security, guarantee of obligations under the contract that is signed after the award).
+    "financial_requirement": qualification security / qualification guarantee, any other financial
+      requirement on the participant (turnover, financial standing, a required qualification
+      deposit or guarantee, a requirement to secure the participant's qualification) that is
+      NOT security for the bid and NOT security for contract performance.
+  Example: a 15% security stated as securing the participant's qualification ->
+  "financial_requirement"; a separate 10% security stated as securing contract performance ->
+  "contract_security". Percentages/amounts alone never decide the type: the stated purpose does.
   Example: the material requiring proof of similar past deliveries -> "experience_requirement";
   requiring a certificate -> "certification"; requiring manufacturer authorization ->
   "manufacturer_authorization". Assuming "medical equipment usually needs registration" without
@@ -140,23 +178,25 @@ source_conflicts: use when announcement/enrichment and the documents materially 
 logistics: always null in this MVP (deep analysis of logistics tenders is a separate stage not
   enabled yet).
 
-EVIDENCE (applies to the top-level evidence list AND to every item/lot/barrier evidence list)
-Each item has source_type, field, download_id, member_name and text (at most 500 characters):
-- source_type "announcement": top-level keys {announcement_fields}; field is the key name;
-  download_id/member_name are null.
-- source_type "enrichment": top-level keys {enrichment_fields}; field is the key name;
-  download_id/member_name are null.
-- source_type "document": copy download_id and member_name exactly from the chunk(s) you
-  quote; field is always the fixed string "{document_field}" regardless of chunk_id. Quote
-  only text that is actually present in that document's chunks.
-evidence.text MUST be a verbatim, contiguous fragment copied character by character from the
-referenced field or document text, in its original language (Armenian, Russian or English).
-Never translate it, paraphrase it, append an explanation, shorten it with an ellipsis, or join
-fragments from different places. Explanations belong in summary/why_interesting/reason-like
-fields, not in evidence. Application code rejects the whole answer if any evidence text is not
-found verbatim in its referenced source, or if a required evidence list (item, lot with a
-description, barrier) is empty.
-Never invent page numbers, quotes, documents, download ids, chunk ids or file names.
+EVIDENCE (applies to the top-level evidence_ids AND to every item/lot/barrier evidence_ids)
+You NEVER write, copy, quote, translate, paraphrase, shorten or reconstruct source text as
+evidence. The application owns all source text: every evidence unit in EVIDENCE_CATALOG has an
+ID such as ev_ann_title_0 or ev_doc_22_a1b2c3_0042. You support a conclusion by returning the
+ID(s) of the unit(s) that prove it, and the application materializes the exact source text
+from those IDs itself.
+- Use only IDs that appear literally in EVIDENCE_CATALOG. Never invent, guess, edit, extend or
+  combine an ID; never output a page number, quote text, file name, download id or chunk id in
+  place of an ID.
+- One or several IDs may support one conclusion. Select the smallest sufficient set of units
+  (normally one to three); do not pad it with loosely related units. Do not repeat an ID inside
+  one evidence_ids list.
+- Choose the unit that itself proves the fact (for a table, the row that states it). If the
+  proof spans neighbouring lines/rows, list those consecutive IDs.
+- Conclusions (summary, why_interesting, descriptions, key_specifications, missing_information
+  and so on) may be paraphrased in your own words; evidence is selected only by ID.
+- Application code rejects the whole answer if any ID is unknown or repeated, or if a required
+  evidence_ids list (item, barrier) is empty. Explanations belong in summary/why_interesting/
+  reason-like fields, not in evidence_ids.
 
 {no_hallucination_rules}
 
@@ -196,7 +236,8 @@ def build_deep_context(tender_context: dict, deep_analysis_context: dict, triage
     Единственный JSON-объект, отправляемый модели на STAGE 2 (см. модульный docstring).
     tender_context / deep_analysis_context / triage_result не изменяются. Детерминирован при
     детерминированном входе (tender_context.build_tender_context /
-    build_deep_analysis_context уже детерминированы).
+    build_deep_analysis_context уже детерминированы). evidence_catalog — units с точным
+    текстом источника (src.ai.evidence_catalog); chunks в контекст не попадают.
     """
     if tender_context["resource_url"] != deep_analysis_context["resource_url"]:
         raise ValueError(
@@ -207,7 +248,7 @@ def build_deep_context(tender_context: dict, deep_analysis_context: dict, triage
     announcement = tender_context["announcement"]
     enrichment = tender_context["enrichment"]
 
-    return {
+    context = {
         "resource_url": tender_context["resource_url"],
         "title": announcement.get("title"),
         "section": announcement.get("section"),
@@ -225,7 +266,15 @@ def build_deep_context(tender_context: dict, deep_analysis_context: dict, triage
         "number_of_lots": enrichment.get("number_of_lots"),
         "document_coverage": dict(tender_context["document_coverage"]),
         "documents": _document_summaries(tender_context),
-        "chunks": [dict(chunk) for chunk in deep_analysis_context["chunks"]],
+        "document_content_stats": dict(deep_analysis_context.get("document_content_stats") or {}),
+        "content_groups": [
+            {
+                **group,
+                "canonical_source": dict(group["canonical_source"]),
+                "represented_sources": [dict(source) for source in group["represented_sources"]],
+            }
+            for group in deep_analysis_context.get("content_groups") or []
+        ],
         "triage": {
             "relevance_status": triage_result["relevance_status"],
             "opportunity_type": triage_result["opportunity_type"],
@@ -234,11 +283,25 @@ def build_deep_context(tender_context: dict, deep_analysis_context: dict, triage
             "reason": triage_result["reason"],
         },
     }
+    context["evidence_catalog"] = evidence_catalog.build_evidence_catalog(
+        context, deep_analysis_context["chunks"],
+    )
+    return context
 
 
 # --------------------------------------------------------------------------
 # structured output schema
 # --------------------------------------------------------------------------
+
+def _model_fields(fields: tuple) -> tuple:
+    """Поля deep-результата в ответе модели v4: evidence (объекты с text) -> evidence_ids."""
+    return tuple(evidence_catalog.EVIDENCE_ID_KEY if name == "evidence" else name for name in fields)
+
+
+def _evidence_ids_schema() -> dict:
+    """Только ID из EVIDENCE_CATALOG: в схеме нет ни одного поля с текстом цитаты."""
+    return {"type": "array", "items": {"type": "string"}}
+
 
 def _barrier_schema() -> dict:
     return {
@@ -247,9 +310,9 @@ def _barrier_schema() -> dict:
             "type": {"type": "string", "enum": list(relevance_schema.PARTICIPATION_BARRIER_TYPES)},
             "description": {"type": "string"},
             "severity": {"type": "string", "enum": list(relevance_schema.CONFIDENCE_LEVELS)},
-            "evidence": {"type": "array", "items": triage_prompt.build_evidence_item_schema()},
+            "evidence_ids": _evidence_ids_schema(),
         },
-        "required": list(relevance_schema.PARTICIPATION_BARRIER_FIELDS),
+        "required": list(_model_fields(relevance_schema.PARTICIPATION_BARRIER_FIELDS)),
         "additionalProperties": False,
     }
 
@@ -279,9 +342,10 @@ def _procurement_item_schema() -> dict:
             "quantity": {"type": _STRING_OR_NULL},
             "unit": {"type": _STRING_OR_NULL},
             "key_specifications": {"type": "array", "items": {"type": "string"}},
-            "evidence": {"type": "array", "items": triage_prompt.build_evidence_item_schema()},
+            "brand_or_equivalent": _brand_or_equivalent_schema(),
+            "evidence_ids": _evidence_ids_schema(),
         },
-        "required": list(relevance_schema.PROCUREMENT_ITEM_FIELDS),
+        "required": list(_model_fields(relevance_schema.PROCUREMENT_ITEM_FIELDS)),
         "additionalProperties": False,
     }
 
@@ -293,9 +357,9 @@ def _procurement_lot_schema() -> dict:
             "lot_number": {"type": "string"},
             "description": {"type": _STRING_OR_NULL},
             "item_count": {"type": _INTEGER_OR_NULL},
-            "evidence": {"type": "array", "items": triage_prompt.build_evidence_item_schema()},
+            "evidence_ids": _evidence_ids_schema(),
         },
-        "required": list(relevance_schema.PROCUREMENT_LOT_FIELDS),
+        "required": list(_model_fields(relevance_schema.PROCUREMENT_LOT_FIELDS)),
         "additionalProperties": False,
     }
 
@@ -340,7 +404,6 @@ def build_deep_output_schema() -> dict:
     strict schema не выражает — это application validation (src.ai.openai_deep_analysis),
     как и в triage_prompt. Каждый вызов возвращает новый dict.
     """
-    evidence_item = triage_prompt.build_evidence_item_schema()
     properties = {
         "summary": {"type": "string"},
         "opportunity_type": {"type": "string", "enum": list(DEEP_MVP_OPPORTUNITY_TYPES)},
@@ -353,14 +416,14 @@ def build_deep_output_schema() -> dict:
         "missing_information": {"type": "array", "items": {"type": "string"}},
         "source_conflicts": {"type": "array", "items": _source_conflict_schema()},
         "manual_review_required": {"type": "boolean"},
-        "evidence": {"type": "array", "items": evidence_item},
+        "evidence_ids": _evidence_ids_schema(),
         "procurement": _procurement_block_schema() | {"type": _OBJECT_OR_NULL},
         "logistics": {"type": "null"},
     }
     return {
         "type": "object",
         "properties": properties,
-        "required": list(relevance_schema.DEEP_ANALYSIS_COMMON_FIELDS),
+        "required": list(_model_fields(relevance_schema.DEEP_ANALYSIS_COMMON_FIELDS)),
         "additionalProperties": False,
     }
 
@@ -377,13 +440,30 @@ def build_text_format() -> dict:
     }
 
 
+# Поля, которые модель видит как units каталога, а не как ключи DEEP_CONTEXT (без дублирования).
+_CATALOG_COVERED_KEYS = (
+    evidence_grounding.ANNOUNCEMENT_EVIDENCE_FIELDS + evidence_grounding.ENRICHMENT_EVIDENCE_FIELDS
+)
+
+
 def serialize_deep_context(deep_context: dict) -> str:
-    """Детерминированная сериализация build_deep_context() output (см. triage_prompt аналог)."""
+    """
+    Детерминированная сериализация метаданных DEEP_CONTEXT (см. triage_prompt аналог). Без
+    evidence_catalog и без полей, которые уже являются units каталога.
+    """
+    metadata = {
+        key: value for key, value in deep_context.items()
+        if key != "evidence_catalog" and key not in _CATALOG_COVERED_KEYS
+    }
     return json.dumps(
-        deep_context, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+        metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
     )
 
 
 def build_user_input(deep_context: dict) -> str:
-    """Текст запроса: только DEEP_CONTEXT."""
-    return "DEEP_CONTEXT (JSON):\n" + serialize_deep_context(deep_context)
+    """Текст запроса: DEEP_CONTEXT (метаданные) + EVIDENCE_CATALOG (точный текст с ID)."""
+    catalog = deep_context["evidence_catalog"]
+    return (
+        "DEEP_CONTEXT (JSON):\n" + serialize_deep_context(deep_context)
+        + f"\n\nEVIDENCE_CATALOG ({len(catalog)} units):\n" + evidence_catalog.render_catalog(catalog)
+    )

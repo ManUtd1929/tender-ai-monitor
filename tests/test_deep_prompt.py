@@ -96,11 +96,25 @@ class BuildDeepContextTests(unittest.TestCase):
             {"download_id": 7, "member_name": "spec.docx", "file_type": "docx", "extraction_status": "success"},
         ])
 
-    def test_chunks_are_carried_over(self):
+    def test_chunks_are_replaced_by_evidence_catalog(self):
         context = deep_prompt.build_deep_context(
             make_tender_context(), make_deep_analysis_context(), make_triage_result(),
         )
-        self.assertEqual(context["chunks"], make_deep_analysis_context()["chunks"])
+        self.assertNotIn("chunks", context)
+        texts = [unit["exact_text"] for unit in context["evidence_catalog"] if unit["source_type"] == "document"]
+        self.assertEqual(texts, ["Ноутбук, 10 шт.", "Гарантия 24 месяца."])
+
+    def test_user_input_shows_catalog_ids_and_exact_text_once(self):
+        context = deep_prompt.build_deep_context(
+            make_tender_context(), make_deep_analysis_context(), make_triage_result(),
+        )
+        user_input = deep_prompt.build_user_input(context)
+        self.assertIn("EVIDENCE_CATALOG", user_input)
+        for unit in context["evidence_catalog"]:
+            self.assertIn(f"[{unit['evidence_id']}", user_input)
+        self.assertEqual(user_input.count("Поставка компьютерной техники"), 1)
+        self.assertEqual(user_input.count("Ноутбук, 10 шт."), 1)
+        self.assertNotIn('"chunks"', user_input)
 
     def test_triage_result_is_summarized(self):
         context = deep_prompt.build_deep_context(
@@ -144,13 +158,20 @@ class BuildDeepContextTests(unittest.TestCase):
         self.assertEqual(deep_prompt.serialize_deep_context(first), deep_prompt.serialize_deep_context(second))
 
 
+def model_fields(fields) -> set:
+    """Поля model output v4/v5: evidence -> evidence_ids."""
+    return {"evidence_ids" if name == "evidence" else name for name in fields}
+
+
 class SchemaTests(unittest.TestCase):
     def setUp(self):
         self.schema = deep_prompt.build_deep_output_schema()
 
     def test_top_level_fields_match_relevance_schema(self):
-        self.assertEqual(set(self.schema["properties"]), set(relevance_schema.DEEP_ANALYSIS_COMMON_FIELDS))
-        self.assertEqual(set(self.schema["required"]), set(relevance_schema.DEEP_ANALYSIS_COMMON_FIELDS))
+        expected = model_fields(relevance_schema.DEEP_ANALYSIS_COMMON_FIELDS)
+        self.assertEqual(set(self.schema["properties"]), expected)
+        self.assertEqual(set(self.schema["required"]), expected)
+        self.assertNotIn("evidence", self.schema["properties"])
         self.assertIs(self.schema["additionalProperties"], False)
 
     def test_opportunity_type_is_restricted_to_mvp(self):
@@ -172,13 +193,15 @@ class SchemaTests(unittest.TestCase):
 
     def test_procurement_item_schema_matches_relevance_schema(self):
         item_schema = self.schema["properties"]["procurement"]["properties"]["items"]["items"]
-        self.assertEqual(set(item_schema["properties"]), set(relevance_schema.PROCUREMENT_ITEM_FIELDS))
-        self.assertEqual(set(item_schema["required"]), set(relevance_schema.PROCUREMENT_ITEM_FIELDS))
+        expected = model_fields(relevance_schema.PROCUREMENT_ITEM_FIELDS)
+        self.assertEqual(set(item_schema["properties"]), expected)
+        self.assertEqual(set(item_schema["required"]), expected)
 
     def test_procurement_lot_schema_matches_relevance_schema(self):
         lot_schema = self.schema["properties"]["procurement"]["properties"]["lots"]["items"]
-        self.assertEqual(set(lot_schema["properties"]), set(relevance_schema.PROCUREMENT_LOT_FIELDS))
-        self.assertEqual(set(lot_schema["required"]), set(relevance_schema.PROCUREMENT_LOT_FIELDS))
+        expected = model_fields(relevance_schema.PROCUREMENT_LOT_FIELDS)
+        self.assertEqual(set(lot_schema["properties"]), expected)
+        self.assertEqual(set(lot_schema["required"]), expected)
 
     def test_brand_or_equivalent_schema_matches_relevance_schema(self):
         brand_schema = self.schema["properties"]["procurement"]["properties"]["brand_or_equivalent"]
@@ -187,7 +210,7 @@ class SchemaTests(unittest.TestCase):
 
     def test_barrier_schema_matches_relevance_schema(self):
         barrier_schema = self.schema["properties"]["participation_barriers"]["items"]
-        self.assertEqual(set(barrier_schema["properties"]), set(relevance_schema.PARTICIPATION_BARRIER_FIELDS))
+        self.assertEqual(set(barrier_schema["properties"]), model_fields(relevance_schema.PARTICIPATION_BARRIER_FIELDS))
         self.assertEqual(
             barrier_schema["properties"]["type"]["enum"], list(relevance_schema.PARTICIPATION_BARRIER_TYPES),
         )
@@ -199,10 +222,41 @@ class SchemaTests(unittest.TestCase):
         conflict_schema = self.schema["properties"]["source_conflicts"]["items"]
         self.assertEqual(set(conflict_schema["properties"]), set(relevance_schema.SOURCE_CONFLICT_FIELDS))
 
-    def test_evidence_item_matches_relevance_schema(self):
-        item = self.schema["properties"]["evidence"]["items"]
-        self.assertEqual(set(item["properties"]), set(relevance_schema.EVIDENCE_FIELDS))
-        self.assertEqual(set(item["required"]), set(relevance_schema.EVIDENCE_FIELDS))
+    def test_every_evidence_field_is_a_list_of_id_strings(self):
+        procurement_item = self.schema["properties"]["procurement"]["properties"]["items"]["items"]
+        procurement_lot = self.schema["properties"]["procurement"]["properties"]["lots"]["items"]
+        barrier = self.schema["properties"]["participation_barriers"]["items"]
+        for container in (self.schema, procurement_item, procurement_lot, barrier):
+            self.assertEqual(
+                container["properties"]["evidence_ids"], {"type": "array", "items": {"type": "string"}},
+            )
+
+    def test_schema_has_no_place_for_model_written_evidence_text(self):
+        def keys(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    yield key
+                    yield from keys(value)
+            elif isinstance(node, list):
+                for value in node:
+                    yield from keys(value)
+
+        names = set(keys(self.schema))
+        for forbidden in ("text", "evidence", "member_name", "download_id", "source_type", "field"):
+            self.assertNotIn(forbidden, names)
+
+    def test_over_max_length_evidence_is_rejected_by_validation(self):
+        evidence = {
+            "source_type": "announcement", "field": "title", "download_id": None, "member_name": None,
+            "text": "x" * (relevance_schema.EVIDENCE_TEXT_MAX_CHARS + 1),
+        }
+        with self.assertRaises(ValueError):
+            relevance_schema.validate_evidence_item(evidence)
+
+    def test_triage_evidence_schema_is_unchanged(self):
+        from src.ai import triage_prompt
+        text_schema = triage_prompt.build_evidence_item_schema()["properties"]["text"]
+        self.assertEqual(text_schema, {"type": "string"})
 
     def test_confidence_enum_comes_from_relevance_schema(self):
         self.assertEqual(
@@ -223,7 +277,7 @@ class SchemaTests(unittest.TestCase):
 
 class PromptContentTests(unittest.TestCase):
     def test_prompt_version_is_set(self):
-        self.assertEqual(deep_prompt.DEEP_PROMPT_VERSION, "procurement-deep-v1")
+        self.assertEqual(deep_prompt.DEEP_PROMPT_VERSION, "procurement-deep-v5")
 
     def test_prompt_has_no_unformatted_placeholders(self):
         self.assertNotIn("{", deep_prompt.SYSTEM_PROMPT)
@@ -233,13 +287,22 @@ class PromptContentTests(unittest.TestCase):
         for term in ("profit", "margin", "ROI", "sourcing/logistics/customs cost", "landed cost"):
             self.assertIn(term, deep_prompt.SYSTEM_PROMPT)
 
-    def test_prompt_demands_verbatim_evidence(self):
-        self.assertIn("verbatim", deep_prompt.SYSTEM_PROMPT)
-        self.assertIn("Never translate", deep_prompt.SYSTEM_PROMPT)
+    def test_prompt_selects_evidence_by_id_only(self):
+        for phrase in (
+            "You NEVER write, copy, quote, translate, paraphrase, shorten or reconstruct source text",
+            "Use only IDs that appear literally in EVIDENCE_CATALOG",
+            "Never invent, guess, edit, extend or\n  combine an ID",
+            "One or several IDs may support one conclusion",
+            "smallest sufficient set",
+            "the application materializes the exact source text",
+            "may be paraphrased in your own words; evidence is selected only by ID",
+            "evidence_ids",
+        ):
+            self.assertIn(phrase, deep_prompt.SYSTEM_PROMPT)
 
-    def test_prompt_lists_document_evidence_field(self):
-        from src.ai import evidence_grounding
-        self.assertIn(evidence_grounding.DEEP_DOCUMENT_EVIDENCE_FIELD, deep_prompt.SYSTEM_PROMPT)
+    def test_prompt_no_longer_asks_for_verbatim_quotes(self):
+        for phrase in ("verbatim, contiguous", "SHORTEST sufficient verbatim", "evidence.text"):
+            self.assertNotIn(phrase, deep_prompt.SYSTEM_PROMPT)
 
     def test_prompt_states_absence_of_evidence_is_not_absence_of_fact(self):
         self.assertIn("ABSENCE OF EVIDENCE IS NOT EVIDENCE OF ABSENCE", deep_prompt.SYSTEM_PROMPT)

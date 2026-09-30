@@ -9,10 +9,13 @@ provider-generic.
 deep_analysis_context, triage_result) -> dict. triage() здесь намеренно не реализован (это
 STAGE 1, отдельный модуль).
 
-Ответ разбирается json.loads без чистки markdown/code fences, затем проходит
+Ответ разбирается json.loads без чистки markdown/code fences. procurement-deep-v4: модель
+возвращает не цитаты, а evidence_ids; src.ai.evidence_catalog строго материализует их в
+evidence с текстом ТОЛЬКО из детерминированного каталога (неизвестный/повторный ID -> ошибка
+валидации, без fuzzy и автоисправления), затем результат проходит
 relevance_schema.validate_deep_analysis_result и MVP-правила этого модуля (opportunity_type
-ограничен procurement/unclear, category snake_case для procurement и null для unclear,
-evidence grounding по deep_context — src.ai.evidence_grounding.validate_deep_evidence_grounding).
+ограничен procurement/unclear, category snake_case для procurement и null для unclear).
+Grounding обеспечен построением: текст evidence не приходит от модели.
 
 Никаких tools/web search/file search/MCP в запросе нет: модель решает только по переданному
 deep_context. Модуль не пишет в БД, не вызывает Telegram и не подключён к monitor.py/
@@ -30,6 +33,7 @@ import time
 import openai
 
 from src.ai import deep_prompt
+from src.ai import evidence_catalog
 from src.ai import evidence_grounding
 from src.ai import openai_triage
 from src.ai import relevance_schema
@@ -37,7 +41,7 @@ from src.ai import relevance_schema
 logger = logging.getLogger(__name__)
 
 PROVIDER = openai_triage.PROVIDER
-DEFAULT_MODEL = "gpt-5.6-terra"
+DEFAULT_MODEL = "gpt-5.6-luna"  # DEEP primary; Terra — настроенный fallback (DEEP_FALLBACK_MODEL)
 DEFAULT_REASONING_EFFORT = "high"
 REASONING_EFFORTS = openai_triage.REASONING_EFFORTS
 
@@ -73,27 +77,31 @@ class DeepAnalysisError(openai_triage.TriageError):
 
 def load_settings(environ=None, model: str | None = None, reasoning_effort: str | None = None) -> dict:
     """
-    {api_key, model, reasoning_effort}: явные аргументы > переменные окружения (OPENAI_API_KEY,
-    OPENAI_MODEL — общая с triage, OPENAI_DEEP_REASONING_EFFORT — отдельная от
-    OPENAI_TRIAGE_REASONING_EFFORT) > defaults (модель gpt-5.6-terra, effort high). Пустая
-    строка считается "не задано". DeepAnalysisError(config) — недопустимый reasoning effort.
+    {api_key, model, reasoning_effort}. Модель: явный аргумент (CLI --model) > DEEP_PRIMARY_MODEL >
+    DEEP_MODEL (legacy) > OPENAI_MODEL (legacy) > gpt-5.6-luna. Effort: явный аргумент >
+    DEEP_PRIMARY_REASONING_EFFORT > DEEP_REASONING_EFFORT (legacy) > OPENAI_DEEP_REASONING_EFFORT >
+    high. Пустая строка считается "не задано". DeepAnalysisError(config) — недопустимый effort.
     """
     environ = os.environ if environ is None else environ
 
-    def pick(explicit, name, default):
-        for value in (explicit, environ.get(name)):
+    def pick(explicit, names, default):
+        for value in (explicit, *(environ.get(name) for name in names)):
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return default
 
-    effort = pick(reasoning_effort, "OPENAI_DEEP_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
+    effort = pick(
+        reasoning_effort,
+        ("DEEP_PRIMARY_REASONING_EFFORT", "DEEP_REASONING_EFFORT", "OPENAI_DEEP_REASONING_EFFORT"),
+        DEFAULT_REASONING_EFFORT,
+    )
     if effort not in REASONING_EFFORTS:
         raise DeepAnalysisError(
             KIND_CONFIG, f"Недопустимый reasoning effort {effort!r} (ожидается одно из {REASONING_EFFORTS})",
         )
     return {
-        "api_key": pick(None, "OPENAI_API_KEY", None),
-        "model": pick(model, "OPENAI_MODEL", DEFAULT_MODEL),
+        "api_key": pick(None, ("OPENAI_API_KEY",), None),
+        "model": pick(model, ("DEEP_PRIMARY_MODEL", "DEEP_MODEL", "OPENAI_MODEL"), DEFAULT_MODEL),
         "reasoning_effort": effort,
     }
 
@@ -123,7 +131,7 @@ def validate_mvp_deep_analysis_result(result: dict, deep_context: dict | None = 
           logistics деталей на этом этапе не бывает — сама relevance_schema уже требует
           logistics=None для этих двух типов;
         - category: snake_case, не null для procurement; null для unclear;
-        - если передан deep_context: каждый evidence item (top-level, каждого participation
+        - если передан deep_context (legacy v3-результаты с цитатами модели): каждый evidence item (top-level, каждого participation
           barrier, каждой procurement item/lot) проходит
           evidence_grounding.validate_deep_evidence_grounding — источник существует и
           evidence.text — дословный фрагмент значения источника/восстановленного из chunks
@@ -228,8 +236,9 @@ class OpenAIDeepAnalysisAnalyzer:
 
     def deep_analyze_with_metadata(self, tender_context: dict, deep_analysis_context: dict, triage_result: dict) -> dict:
         """
-        {"result": validated deep-analysis dict, "usage": dict | None, "response_id": str | None,
-        "attempts": int}. DeepAnalysisError (см. KIND_*) — любая ошибка; usage/response_id/
+        {"result": validated deep-analysis dict (evidence материализован из каталога),
+        "raw_model_output": dict (ответ модели с evidence_ids), "usage": dict | None,
+        "response_id": str | None, "attempts": int}. DeepAnalysisError (см. KIND_*) — любая ошибка; usage/response_id/
         attempts прикладываются, если известны.
         """
         client = self.ensure_client()
@@ -245,12 +254,12 @@ class OpenAIDeepAnalysisAnalyzer:
         response_id = getattr(response, "id", None)
         details = {"usage": usage, "response_id": response_id, "attempts": attempts}
 
-        result = self._parse_response(response, deep_context, details)
+        raw, result = self._parse_response(response, deep_context, details)
         logger.info(
             "OpenAI deep analysis результат: %s/%s manual_review_required=%s usage=%s",
             result["opportunity_type"], result["category"], result["manual_review_required"], usage,
         )
-        return {"result": result, **details}
+        return {"result": result, "raw_model_output": raw, **details}
 
     def deep_analyze(self, tender_context: dict, deep_analysis_context: dict, triage_result: dict) -> dict:
         """Analyzer interface relevance_pipeline: validated deep-analysis result."""
@@ -261,7 +270,8 @@ class OpenAIDeepAnalysisAnalyzer:
 
     # -- parsing -----------------------------------------------------------
 
-    def _parse_response(self, response, deep_context: dict, details: dict) -> dict:
+    def _parse_response(self, response, deep_context: dict, details: dict) -> tuple:
+        """(raw_model_output, validated materialized result)."""
         status = getattr(response, "status", None)
         text, refusal = openai_triage.output_parts(response)
 
@@ -286,6 +296,7 @@ class OpenAIDeepAnalysisAnalyzer:
             )
 
         try:
-            return validate_mvp_deep_analysis_result(raw, deep_context)
+            materialized = evidence_catalog.materialize_deep_model_output(raw, deep_context["evidence_catalog"])
+            return raw, validate_mvp_deep_analysis_result(materialized)
         except ValueError as error:
             raise DeepAnalysisError(KIND_VALIDATION, f"Application validation: {error}", **details) from error

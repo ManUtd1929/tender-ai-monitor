@@ -189,6 +189,20 @@ def _check_deep_document(item: dict, deep_context: dict) -> None:
 
     text = _reconstruct_document_text(deep_context, download_id, member_name)
     if not text:
+        # Дедупликация: контент отправлен один раз под canonical_source. Цитата представленного
+        # (represented) источника принимается, только если он реально числится в content_group
+        # (identical extracted text) — проверяется по тому же canonical тексту.
+        for group in deep_context.get("content_groups") or []:
+            if any(
+                source["download_id"] == download_id and source["member_name"] == member_name
+                for source in group["represented_sources"]
+            ):
+                canonical = group["canonical_source"]
+                text = _reconstruct_document_text(
+                    deep_context, canonical["download_id"], canonical["member_name"],
+                )
+                break
+    if not text:
         raise ValueError(
             f"evidence: у документа download_id={download_id} member_name={member_name!r} нет chunks в "
             "deep_context.chunks, цитировать нечего"

@@ -332,6 +332,12 @@ def count_deep_analysis(db_path=None) -> int:
 # кандидаты
 # --------------------------------------------------------------------------
 
+def list_enriched_resource_urls(db_path=None) -> list:
+    """resource_url объявлений с enrichment, самые старые (first_seen_at) первыми."""
+    with _connect(db_path) as conn:
+        return [row[0] for row in conn.execute(SELECT_ENRICHED_RESOURCE_URLS).fetchall()]
+
+
 def get_triage_candidates(db_path=None, limit: int | None = None) -> list:
     """
     Объявления с enrichment, для которых triage отсутствует или их текущий

@@ -39,13 +39,14 @@ from pathlib import Path
 from src.ai import deep_prompt
 from src.ai import golden_set
 from src.ai import openai_deep_analysis
+from src.ai import pricing
 from src.ai import relevance_schema
 from src.ai import tender_context as tender_context_module
-from src.ai.golden_set_evaluator import load_valid_cases
+from src.ai.golden_set_evaluator import cost_summary, load_valid_cases
 
 logger = logging.getLogger(__name__)
 
-EVALUATOR_VERSION = "1"
+EVALUATOR_VERSION = "2"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DEEP_RUNS_DIR = PROJECT_ROOT / "evaluation" / "deep_runs"
@@ -163,7 +164,9 @@ def _base_record(case: dict) -> dict:
         "status": None,
         "document_coverage": None,
         "input_size_chars": None,
+        "evidence_units": None,
         "prediction": None,
+        "raw_model_output": None,
         "usage": None,
         "response_id": None,
         "attempts": None,
@@ -195,6 +198,7 @@ def evaluate_case(case: dict, analyzer, db_path=None) -> dict:
     record["document_coverage"] = dict(tender_context["document_coverage"])
     deep_context = deep_prompt.build_deep_context(tender_context, deep_analysis_context, triage_result)
     record["input_size_chars"] = len(deep_prompt.build_user_input(deep_context))
+    record["evidence_units"] = len(deep_context["evidence_catalog"])
 
     try:
         outcome = _call_analyzer(analyzer, tender_context, deep_analysis_context, triage_result)
@@ -213,7 +217,10 @@ def evaluate_case(case: dict, analyzer, db_path=None) -> dict:
         return record
 
     record["status"] = RECORD_SCORED
+    # prediction — материализованный результат (evidence.text из каталога, для ручной проверки);
+    # raw_model_output — ответ модели (только evidence_ids). Сам каталог в artifact не пишется.
     record["prediction"] = outcome["result"]
+    record["raw_model_output"] = outcome.get("raw_model_output")
     record["usage"] = outcome.get("usage")
     record["response_id"] = outcome.get("response_id")
     record["attempts"] = outcome.get("attempts")
@@ -237,6 +244,8 @@ def build_artifact(record: dict, analyzer, golden_path, started_at: datetime) ->
         "reasoning_effort": getattr(analyzer, "reasoning_effort", None),
         "timestamp": started_at.isoformat(),
         "golden_set": Path(golden_path).name,
+        "usage": pricing.normalize_usage(record.get("usage")),
+        "cost": cost_summary(getattr(analyzer, "model", None), [record]),
         "case": record,
     }
 
@@ -274,11 +283,13 @@ def format_case_detail(record: dict) -> str:
         lines.append(f"  document_coverage: {record['document_coverage']}")
     if record["input_size_chars"] is not None:
         lines.append(f"  input size (DEEP_CONTEXT user input): {record['input_size_chars']} символов")
+    if record["evidence_units"] is not None:
+        lines.append(f"  evidence catalog: {record['evidence_units']} units")
     if record["error"] is not None:
         lines.append(f"  ERROR [{record['error']['kind']}]: {record['error']['message']}")
     if record["prediction"] is not None:
         prediction = record["prediction"]
-        lines.append(f"  validation status: OK (прошёл relevance_schema + deep-MVP + evidence grounding)")
+        lines.append(f"  validation status: OK (прошёл relevance_schema + deep-MVP + evidence_ids каталога)")
         lines.append(f"  manual_review_required: {prediction['manual_review_required']}")
         lines.append(f"  missing_information: {prediction['missing_information']}")
         lines.append(f"  participation_barriers: {json.dumps(prediction['participation_barriers'], ensure_ascii=False)}")
@@ -308,9 +319,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--path", default=str(golden_set.DEFAULT_GOLDEN_SET_PATH), help="Файл golden set")
     parser.add_argument("--db-path", default=None, help="SQLite БД (по умолчанию data/tenders.db, read-only)")
     parser.add_argument("--runs-dir", default=str(DEFAULT_DEEP_RUNS_DIR), help="Куда писать run artifact")
-    parser.add_argument("--model", default=None, help="Переопределить OPENAI_MODEL")
+    parser.add_argument("--model", default=None, help="Переопределить DEEP_PRIMARY_MODEL (приоритет над env/default)")
     parser.add_argument(
-        "--reasoning-effort", default=None, help="Переопределить OPENAI_DEEP_REASONING_EFFORT",
+        "--reasoning-effort", default=None, help="Переопределить DEEP_PRIMARY_REASONING_EFFORT",
     )
     return parser
 
@@ -402,6 +413,7 @@ def main(argv=None, analyzer=None) -> int:
     print(format_case_detail(record))
 
     artifact = build_artifact(record, analyzer, args.path, started_at)
+    print(f"Usage: {artifact['usage']}  estimated_cost_usd={artifact['cost']['estimated_cost_usd']}")
     print(f"\nRun artifact: {save_artifact(artifact, args.runs_dir)}")
 
     return 0 if record["status"] == RECORD_SCORED else 1

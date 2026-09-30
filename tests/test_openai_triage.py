@@ -138,7 +138,7 @@ def make_analyzer(*outcomes, **kwargs):
 class SettingsTests(unittest.TestCase):
     def test_defaults(self):
         analyzer = openai_triage.OpenAITriageAnalyzer(client=FakeClient(), environ={})
-        self.assertEqual(analyzer.model, "gpt-5.6-terra")
+        self.assertEqual(analyzer.model, "gpt-5.6-luna")
         self.assertEqual(analyzer.reasoning_effort, "medium")
         self.assertEqual(analyzer.prompt_version, "procurement-v2")
 
@@ -160,7 +160,7 @@ class SettingsTests(unittest.TestCase):
         analyzer = openai_triage.OpenAITriageAnalyzer(
             client=FakeClient(), environ={"OPENAI_MODEL": "  ", "OPENAI_TRIAGE_REASONING_EFFORT": ""},
         )
-        self.assertEqual((analyzer.model, analyzer.reasoning_effort), ("gpt-5.6-terra", "medium"))
+        self.assertEqual((analyzer.model, analyzer.reasoning_effort), ("gpt-5.6-luna", "medium"))
 
     def test_invalid_reasoning_effort_is_config_error(self):
         with self.assertRaises(openai_triage.TriageError) as context:
@@ -202,7 +202,7 @@ class BuildRequestTests(unittest.TestCase):
         self.request = self.analyzer.build_request(TRIAGE_CONTEXT)
 
     def test_model_and_reasoning(self):
-        self.assertEqual(self.request["model"], "gpt-5.6-terra")
+        self.assertEqual(self.request["model"], "gpt-5.6-luna")
         self.assertEqual(self.request["reasoning"], {"effort": "medium"})
 
     def test_structured_output_schema_is_used(self):
@@ -304,7 +304,7 @@ class ValidResponseTests(unittest.TestCase):
         outcome = self.assertAccepted({})
         self.assertEqual(outcome["usage"], {
             "input_tokens": 100, "output_tokens": 50, "total_tokens": 150,
-            "cached_tokens": 10, "reasoning_tokens": 30,
+            "cached_tokens": 10, "cache_write_tokens": 0, "reasoning_tokens": 30,
         })
         self.assertEqual(outcome["response_id"], "resp_test_1")
 
