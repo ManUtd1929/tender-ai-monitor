@@ -12,3 +12,9 @@ logs/
 # Артефакты запусков AI evaluation (golden_set_procurement.json остаётся tracked)
 evaluation/runs/
 evaluation/deep_runs/
+
+# Local development and diagnostic artifacts
+/golden_set.json
+/golden_set_full.json
+/medical_luna_v4_console.txt
+/src/scraper/armeps_probe.py
