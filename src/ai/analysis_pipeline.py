@@ -41,6 +41,7 @@ OpenAI client здесь не создаётся: analyzers инъектирую
 CLI:
     python -m src.ai.analysis_pipeline --dry-run [--limit N]
     python -m src.ai.analysis_pipeline --run-one "<URL>" [--confirm-paid-call] [--allow-expired]   (см. src.ai.one_shot)
+    python -m src.ai.analysis_pipeline --run-batch --limit N [--confirm-paid-call]   (см. src.ai.operator_batch)
 """
 
 import argparse
@@ -1011,18 +1012,25 @@ def main(argv=None) -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except AttributeError:
         pass
-    parser = argparse.ArgumentParser(description="AI analysis pipeline (batch live-режима в CLI нет)")
+    parser = argparse.ArgumentParser(description="AI analysis pipeline")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="Отчёт без API и без записи")
     mode.add_argument("--run-one", metavar="RESOURCE_URL", help="Один явно выбранный тендер (preflight без confirm)")
-    parser.add_argument("--confirm-paid-call", action="store_true", help="Только с --run-one: разрешить платные вызовы")
+    mode.add_argument("--run-batch", action="store_true",
+                      help="Операторский batch ровно из --limit N тендеров (без --confirm-paid-call — только preview)")
+    parser.add_argument("--confirm-paid-call", action="store_true",
+                        help="Только с --run-one / --run-batch: разрешить платные вызовы")
     parser.add_argument("--allow-expired", action="store_true",
                         help="Только с --run-one: обойти ТОЛЬКО deadline-гейт (BudgetGuard/учёт/Gate остаются)")
     parser.add_argument("--limit", type=int, default=None, help="Ограничить число тендеров (оператор)")
     parser.add_argument("--db-path", default=None, help="SQLite БД (для --run-one: иначе DATABASE_PATH из env/.env, иначе data/tenders.db)")
     args = parser.parse_args(argv)
-    if args.confirm_paid_call and not args.run_one:
-        parser.error("--confirm-paid-call допустим только с --run-one")
+    if args.confirm_paid_call and not (args.run_one or args.run_batch):
+        parser.error("--confirm-paid-call допустим только с --run-one или --run-batch")
+    if args.run_batch and args.limit is None:
+        parser.error("--run-batch требует явный --limit N (скрытого значения по умолчанию нет)")
+    if args.run_batch and args.limit <= 0:
+        parser.error("--limit должен быть > 0")
     if args.allow_expired and not args.run_one:
         parser.error("--allow-expired допустим только с --run-one")
     if args.run_one and args.limit is not None:
@@ -1032,6 +1040,17 @@ def main(argv=None) -> int:
 
     load_dotenv(PROJECT_ROOT / ".env")  # не перезаписывает уже заданные переменные окружения
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+    if args.run_batch:
+        from src.ai import one_shot, operator_batch
+
+        settings = load_budget_settings()
+        triage, deep = build_analyzers(settings)
+        if args.confirm_paid_call and not (triage.has_api_key and deep.has_api_key):
+            print("ERROR: OPENAI_API_KEY не задан, вызовов нет")
+            return one_shot.EXIT_USAGE
+        return operator_batch.run_batch(
+            args.limit, triage, deep, settings, db_path=resolve_db_path(args.db_path), confirm=args.confirm_paid_call,
+        )
     if args.run_one:
         from src.ai import one_shot
 
