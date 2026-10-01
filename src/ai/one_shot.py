@@ -18,7 +18,7 @@ from src.ai import commercial_gate, deep_admission, deep_prompt, preflight, pric
 from src.ai import tender_context as tender_context_module
 from src.ai.analysis_pipeline import AnalysisPipeline, _ReadOnlyStore, _stage_is_current
 from src.ai.budget_guard import ANALYSIS_TRIAGE
-from src.database import ai_usage_repository
+from src.database import ai_usage_repository, tender_repository
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 2
 
@@ -126,6 +126,7 @@ def _print_report(url, outcome, rows, db_path, out) -> None:
 
 def run_one(resource_url, triage, deep, settings, db_path=None, confirm=False, out=print) -> int:
     """Код возврата: 0 — ok / preflight-only, 1 — пайплайн завершился ошибкой, 2 — ошибка запуска (вызовов нет)."""
+    db_path = tender_repository.resolve_db_path(db_path)  # один раз; дальше везде уже resolved Path, не None
     try:
         store = _ReadOnlyStore(db_path)
     except sqlite3.Error as error:

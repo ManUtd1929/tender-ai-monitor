@@ -6,6 +6,7 @@
 """
 
 import logging
+import os
 import sqlite3
 import sys
 from contextlib import closing, contextmanager
@@ -38,6 +39,20 @@ INSERT OR IGNORE INTO tenders (
     published_at, tender_time_raw, first_seen_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?)
 """
+
+
+def resolve_db_path(explicit=None, environ=None) -> Path:
+    """Приоритет: явный путь (CLI) > DATABASE_PATH из окружения/.env > DEFAULT_DB_PATH.
+
+    Относительный DATABASE_PATH считается от корня проекта (не от cwd).
+    """
+    if explicit is not None:
+        return Path(explicit)
+    env_value = (os.environ if environ is None else environ).get("DATABASE_PATH", "").strip()
+    if env_value:
+        path = Path(env_value)
+        return path if path.is_absolute() else PROJECT_ROOT / path
+    return DEFAULT_DB_PATH
 
 
 def _resolve_path(db_path) -> Path:

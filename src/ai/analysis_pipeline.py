@@ -54,7 +54,7 @@ from src.ai import tender_context as tender_context_module
 from src.ai.budget_guard import ANALYSIS_DEEP, ANALYSIS_TRIAGE, BudgetGuard
 from src.ai.budget_settings import BudgetSettings, load_budget_settings
 from src.database import ai_usage_repository, analysis_repository, pipeline_state_repository as state_repo
-from src.database.tender_repository import DEFAULT_DB_PATH
+from src.database.tender_repository import DEFAULT_DB_PATH, resolve_db_path
 
 logger = logging.getLogger(__name__)
 
@@ -907,7 +907,7 @@ def main(argv=None) -> int:
     mode.add_argument("--run-one", metavar="RESOURCE_URL", help="Один явно выбранный тендер (preflight без confirm)")
     parser.add_argument("--confirm-paid-call", action="store_true", help="Только с --run-one: разрешить платные вызовы")
     parser.add_argument("--limit", type=int, default=None, help="Ограничить число тендеров (оператор)")
-    parser.add_argument("--db-path", default=None, help="SQLite БД (по умолчанию data/tenders.db)")
+    parser.add_argument("--db-path", default=None, help="SQLite БД (для --run-one: иначе DATABASE_PATH из env/.env, иначе data/tenders.db)")
     args = parser.parse_args(argv)
     if args.confirm_paid_call and not args.run_one:
         parser.error("--confirm-paid-call допустим только с --run-one")
@@ -927,7 +927,8 @@ def main(argv=None) -> int:
             print("ERROR: OPENAI_API_KEY не задан, вызовов нет")
             return one_shot.EXIT_USAGE
         return one_shot.run_one(
-            args.run_one, triage, deep, settings, db_path=args.db_path, confirm=args.confirm_paid_call,
+            args.run_one, triage, deep, settings, db_path=resolve_db_path(args.db_path),
+            confirm=args.confirm_paid_call,
         )
     _print_dry_run(dry_run(db_path=args.db_path, limit=args.limit))
     return 0

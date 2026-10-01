@@ -181,5 +181,97 @@ class CliTests(OneShotTestCase):
         self.openai_client.assert_not_called()
 
 
+class DbPathResolutionTests(OneShotTestCase):
+    """Регрессия: --run-one без --db-path падал на sqlite3.connect(None)."""
+
+    def run_main(self, argv, env):
+        """main() с подменённым окружением; .env не читается, run_one перехвачен."""
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch("dotenv.load_dotenv"), \
+             mock.patch.object(one_shot, "run_one", return_value=0) as run_one:
+            if "DATABASE_PATH" not in env:
+                os.environ.pop("DATABASE_PATH", None)
+            analysis_pipeline.main(argv)
+        return run_one
+
+    def resolved_by_run_one(self, db_path_arg, env, confirm=False):
+        """Реальный run_one; возвращает db_path, полученный каждым helper-ом."""
+        seen = []
+        real_max, real_rows = one_shot._max_event_id, one_shot._ledger_rows
+
+        def spy_max(path):
+            seen.append(path)
+            return real_max(path)
+
+        def spy_rows(path, url, after):
+            seen.append(path)
+            return real_rows(path, url, after)
+
+        url = self.add(1)
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(one_shot, "_max_event_id", spy_max), \
+             mock.patch.object(one_shot, "_ledger_rows", spy_rows):
+            one_shot.run_one(url, self.triage, self.deep, self.settings, db_path=db_path_arg,
+                             confirm=confirm, out=lambda _: None)
+        return seen
+
+    def test_env_path_used_without_cli_arg(self):
+        from src.database import tender_repository as repo
+        run_one = self.run_main(["--run-one", "u"], {"DATABASE_PATH": "data/custom.db"})
+        self.assertEqual(run_one.call_args.kwargs["db_path"], repo.PROJECT_ROOT / "data" / "custom.db")
+
+    def test_main_default_and_explicit(self):
+        from src.database import tender_repository as repo
+        run_one = self.run_main(["--run-one", "u"], {})
+        self.assertEqual(run_one.call_args.kwargs["db_path"], repo.DEFAULT_DB_PATH)
+        run_one = self.run_main(["--run-one", "u", "--db-path", "cli.db"], {"DATABASE_PATH": "env.db"})
+        self.assertEqual(str(run_one.call_args.kwargs["db_path"]), "cli.db")
+
+    def test_resolver_env_relative_and_absolute(self):
+        from pathlib import Path
+        from src.database import tender_repository as repo
+        self.assertEqual(repo.resolve_db_path(None, {"DATABASE_PATH": "data/x.db"}), repo.PROJECT_ROOT / "data" / "x.db")
+        absolute = Path(self.db_path).resolve()
+        self.assertEqual(repo.resolve_db_path(None, {"DATABASE_PATH": str(absolute)}), absolute)
+
+    def test_project_default_without_env(self):
+        from src.database import tender_repository as repo
+        self.assertEqual(repo.resolve_db_path(None, {}), repo.DEFAULT_DB_PATH)
+        self.assertEqual(repo.resolve_db_path(None, {"DATABASE_PATH": "  "}), repo.DEFAULT_DB_PATH)
+
+    def test_explicit_cli_path_beats_env(self):
+        from src.database import tender_repository as repo
+        self.assertEqual(repo.resolve_db_path("cli.db", {"DATABASE_PATH": "env.db"}).name, "cli.db")
+        seen = self.resolved_by_run_one(self.db_path, {"DATABASE_PATH": "should/not/be/used.db"}, confirm=True)
+        self.assertTrue(seen)
+        self.assertTrue(all(str(p) == str(self.db_path) for p in seen))
+
+    def test_env_path_reaches_pipeline_when_no_cli_arg(self):
+        seen = self.resolved_by_run_one(None, {"DATABASE_PATH": str(self.db_path)}, confirm=True)
+        self.assertTrue(seen)
+        self.assertTrue(all(p is not None and str(p) == str(self.db_path) for p in seen))
+
+    def test_default_path_reaches_pipeline_when_no_cli_arg_and_no_env(self):
+        from src.database import tender_repository as repo
+        env = dict(os.environ)
+        env.pop("DATABASE_PATH", None)
+        with mock.patch.object(repo, "DEFAULT_DB_PATH", self.db_path), \
+             mock.patch.dict(os.environ, env, clear=True):
+            seen = self.resolved_by_run_one(None, {}, confirm=True)
+        self.assertTrue(seen)
+        self.assertTrue(all(p is not None and str(p) == str(self.db_path) for p in seen))
+
+    def test_no_confirm_without_db_path_no_client_no_writes(self):
+        url = self.add(1)
+        with mock.patch.dict(os.environ, {"DATABASE_PATH": str(self.db_path)}):
+            before = self.state(url)
+            code = one_shot.run_one(url, self.triage, self.deep, self.settings, db_path=None,
+                                    confirm=False, out=lambda _: None)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.total_calls(), 0)
+        self.openai_client.assert_not_called()
+        self.assertEqual(self.state(url), before)
+
+
 if __name__ == "__main__":
     unittest.main()
