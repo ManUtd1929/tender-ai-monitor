@@ -816,6 +816,7 @@ class AnalysisPipeline:
         )
         return {
             "candidate_count": len(candidates), "processed_count": len(results),
+            "expired_candidate_count": sum(1 for c in candidates if c["reason"] == REASON_SKIP_EXPIRED),
             "failed_count": len(failures), "state_counts": state_counts, "api_calls": api_calls,
             "results": results, "failures": failures, "accounting_blocked": accounting_blocked,
             "batch_cost_usd": self._ledger_cost_since(ledger_before),
@@ -902,9 +903,15 @@ def summarize_monitor_batch(batch: dict, limit: int) -> dict:
     results = batch["results"]
     states = [r.get("state") for r in results]
     count = states.count
+    # Истёкшие обрабатываются без AI ($0) и в batch_limit не входят: считаются отдельно от AI work items.
+    expired_excluded = batch.get("expired_candidate_count", count(state_repo.STATE_SKIPPED_EXPIRED))
+    selected_ai = batch["candidate_count"] - expired_excluded
+    processed_ai = batch["processed_count"] - count(state_repo.STATE_SKIPPED_EXPIRED)
     return {
         "status": "ok", "ai_enabled": True, "batch_limit": limit,
-        "selected": batch["candidate_count"], "processed": batch["processed_count"],
+        "selected_ai_candidates": selected_ai, "processed_ai_candidates": processed_ai,
+        "expired_excluded": expired_excluded,
+        "selected": selected_ai, "processed": processed_ai,  # aliases (только AI work items, без expired)
         "triage_api_calls": batch["api_calls"]["triage"], "deep_api_calls": batch["api_calls"]["deep"],
         "deep_completed": count(state_repo.STATE_DEEP_COMPLETED),
         "not_relevant": count(state_repo.STATE_STOPPED_NOT_RELEVANT),

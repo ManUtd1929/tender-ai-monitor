@@ -95,6 +95,38 @@ class MonitorAiBatchTests(DeadlineCase):
         for url in expired:
             self.assertEqual(self.state(url)["state"], state_repo.STATE_SKIPPED_EXPIRED)
 
+    def test_summary_separates_expired_from_ai_candidates(self):
+        expired = self.add_deadline(1, PAST)
+        active = [self.add_deadline(n, FUTURE) for n in range(100, 105)]
+        result = self.run_ai("5")
+        self.assertEqual(result["batch_limit"], 5)
+        self.assertEqual(result["selected_ai_candidates"], 5)
+        self.assertEqual(result["processed_ai_candidates"], 5)
+        self.assertEqual((result["selected"], result["processed"]), (5, 5))  # aliases = AI work items
+        self.assertEqual(result["expired_excluded"], 1)
+        self.assertLessEqual(result["triage_api_calls"], 5)
+        self.assertEqual(self.triage.calls, active)
+        self.assertEqual(self.state(expired)["state"], state_repo.STATE_SKIPPED_EXPIRED)
+        for key in ("deep_api_calls", "deep_completed", "not_relevant", "errors", "escalations",
+                    "budget_deferred", "accounting_blocked", "batch_cost_usd"):
+            self.assertIn(key, result)
+
+    def test_expired_do_not_reduce_available_ai_slots(self):
+        for n in range(1, 4):
+            self.add_deadline(n, PAST)
+        active = [self.add_deadline(n, FUTURE) for n in range(100, 110)]
+        result = self.run_ai("5")
+        self.assertEqual(result["selected_ai_candidates"], 5)
+        self.assertEqual(result["expired_excluded"], 3)
+        self.assertEqual(self.triage.calls, active[:5])
+
+    def test_summary_without_expired(self):
+        for n in range(1, 4):
+            self.add_deadline(n, FUTURE)
+        result = self.run_ai("5")
+        self.assertEqual((result["selected_ai_candidates"], result["processed_ai_candidates"]), (3, 3))
+        self.assertEqual(result["expired_excluded"], 0)
+
     def test_reusable_result_creates_no_paid_call(self):
         self.add_deadline(1, FUTURE)
         self.run_ai("5")
