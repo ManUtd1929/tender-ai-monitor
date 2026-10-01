@@ -218,7 +218,7 @@ def evaluate_case(case: dict, analyzer, db_path=None) -> dict:
 
     record["status"] = RECORD_SCORED
     # prediction — материализованный результат (evidence.text из каталога, для ручной проверки);
-    # raw_model_output — ответ модели (только evidence_ids). Сам каталог в artifact не пишется.
+    # raw_model_output — ответ модели (только evidence_refs). Сам каталог в artifact не пишется.
     record["prediction"] = outcome["result"]
     record["raw_model_output"] = outcome.get("raw_model_output")
     record["usage"] = outcome.get("usage")
@@ -289,7 +289,7 @@ def format_case_detail(record: dict) -> str:
         lines.append(f"  ERROR [{record['error']['kind']}]: {record['error']['message']}")
     if record["prediction"] is not None:
         prediction = record["prediction"]
-        lines.append(f"  validation status: OK (прошёл relevance_schema + deep-MVP + evidence_ids каталога)")
+        lines.append(f"  validation status: OK (прошёл relevance_schema + deep-MVP + evidence_refs каталога)")
         lines.append(f"  manual_review_required: {prediction['manual_review_required']}")
         lines.append(f"  missing_information: {prediction['missing_information']}")
         lines.append(f"  participation_barriers: {json.dumps(prediction['participation_barriers'], ensure_ascii=False)}")

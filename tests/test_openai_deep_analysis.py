@@ -19,7 +19,7 @@ try:
 except ImportError:  # pragma: no cover
     import httpx
 
-from src.ai import deep_prompt, openai_deep_analysis, openai_triage, relevance_schema
+from src.ai import deep_prompt, evidence_catalog, openai_deep_analysis, openai_triage, relevance_schema
 from tests.test_deep_prompt import make_deep_analysis_context, make_tender_context, make_triage_result
 
 API_KEY = "sk-test-secret-key-123"
@@ -42,6 +42,17 @@ NOTEBOOK_ID = unit_id("Ноутбук, 10 шт.")
 WARRANTY_ID = unit_id("Гарантия 24 месяца.")
 
 
+def unit_ref(text: str) -> int:
+    """Request-local числовая ссылка (1-based позиция в каталоге) unit'а с точным текстом."""
+    return evidence_catalog.evidence_ref_map(DEEP_CONTEXT["evidence_catalog"])[unit_id(text)]
+
+
+TITLE_REF = unit_ref("Поставка компьютерной техники")
+NOTEBOOK_REF = unit_ref("Ноутбук, 10 шт.")
+NOTEBOOK_REF_STR = str(NOTEBOOK_REF)
+WARRANTY_REF = unit_ref("Гарантия 24 месяца.")
+
+
 def materialized(*evidence_ids) -> list:
     """Ожидаемый materialized evidence: текст берётся из каталога."""
     index = {u["evidence_id"]: u for u in DEEP_CONTEXT["evidence_catalog"]}
@@ -62,7 +73,7 @@ def procurement_block(**overrides) -> dict:
     block["subject"] = "Поставка ноутбуков"
     block["items"] = [{
         "item_name": "Ноутбук", "lot_number": None, "quantity": "10", "unit": "шт.",
-        "key_specifications": [], "brand_or_equivalent": None, "evidence_ids": [NOTEBOOK_ID],
+        "key_specifications": [], "brand_or_equivalent": None, "evidence_refs": [NOTEBOOK_REF],
     }]
     block.update(overrides)
     return block
@@ -81,7 +92,7 @@ def payload(**overrides) -> dict:
         "missing_information": [],
         "source_conflicts": [],
         "manual_review_required": False,
-        "evidence_ids": [TITLE_ID],
+        "evidence_refs": [TITLE_REF],
         "procurement": procurement_block(),
         "logistics": None,
     }
@@ -159,7 +170,7 @@ class SettingsTests(unittest.TestCase):
         analyzer = openai_deep_analysis.OpenAIDeepAnalysisAnalyzer(client=FakeClient(), environ={})
         self.assertEqual(analyzer.model, "gpt-5.6-luna")
         self.assertEqual(analyzer.reasoning_effort, "high")
-        self.assertEqual(analyzer.prompt_version, "procurement-deep-v6")
+        self.assertEqual(analyzer.prompt_version, "procurement-deep-v7")
 
     def test_shared_openai_model_env_var_is_used(self):
         analyzer = openai_deep_analysis.OpenAIDeepAnalysisAnalyzer(
@@ -225,7 +236,7 @@ class BuildRequestTests(unittest.TestCase):
         self.assertEqual(self.request["reasoning"], {"effort": "high"})
 
     def test_structured_output_schema_is_used(self):
-        self.assertEqual(self.request["text"], deep_prompt.build_text_format())
+        self.assertEqual(self.request["text"], deep_prompt.build_text_format(len(self.deep_context["evidence_catalog"])))
         self.assertIs(self.request["text"]["format"]["strict"], True)
 
     def test_no_tools(self):
@@ -260,13 +271,13 @@ class ValidResponseTests(unittest.TestCase):
             total_lots=2,
             items=[
                 {"item_name": "Ноутбук", "lot_number": "1", "quantity": "10", "unit": "шт.",
-                 "key_specifications": [], "brand_or_equivalent": None, "evidence_ids": [NOTEBOOK_ID]},
+                 "key_specifications": [], "brand_or_equivalent": None, "evidence_refs": [NOTEBOOK_REF]},
                 {"item_name": "Монитор", "lot_number": "2", "quantity": None, "unit": None,
-                 "key_specifications": [], "brand_or_equivalent": None, "evidence_ids": [NOTEBOOK_ID, WARRANTY_ID]},
+                 "key_specifications": [], "brand_or_equivalent": None, "evidence_refs": [NOTEBOOK_REF, WARRANTY_REF]},
             ],
             lots=[
-                {"lot_number": "1", "description": "Ноутбуки", "item_count": 1, "evidence_ids": [NOTEBOOK_ID]},
-                {"lot_number": "2", "description": "Мониторы", "item_count": 1, "evidence_ids": []},
+                {"lot_number": "1", "description": "Ноутбуки", "item_count": 1, "evidence_refs": [NOTEBOOK_REF]},
+                {"lot_number": "2", "description": "Мониторы", "item_count": 1, "evidence_refs": []},
             ],
         )
         outcome = self.assertAccepted({"procurement": block})
@@ -280,10 +291,10 @@ class ValidResponseTests(unittest.TestCase):
     def test_barrier_with_evidence_accepted(self):
         barrier = {
             "type": "official_dealer_required", "description": "Требуется официальный дилер",
-            "severity": "medium", "evidence_ids": [WARRANTY_ID],
+            "severity": "medium", "evidence_refs": [WARRANTY_REF],
         }
         outcome = self.assertAccepted({"participation_barriers": [barrier]})
-        expected = {**{k: v for k, v in barrier.items() if k != "evidence_ids"}, "evidence": materialized(WARRANTY_ID)}
+        expected = {**{k: v for k, v in barrier.items() if k != "evidence_refs"}, "evidence": materialized(WARRANTY_ID)}
         self.assertEqual(outcome["result"]["participation_barriers"], [expected])
 
     def test_source_conflict_round_trips(self):
@@ -296,13 +307,13 @@ class ValidResponseTests(unittest.TestCase):
         self.assertEqual(outcome["result"]["source_conflicts"], [conflict])
 
     def test_document_evidence_is_materialized_from_catalog(self):
-        outcome = self.assertAccepted({"evidence_ids": [NOTEBOOK_ID]})
+        outcome = self.assertAccepted({"evidence_refs": [NOTEBOOK_REF]})
         self.assertEqual(outcome["result"]["evidence"], materialized(NOTEBOOK_ID))
         self.assertEqual(outcome["result"]["evidence"][0]["text"], "Ноутбук, 10 шт.")
         self.assertEqual(outcome["result"]["evidence"][0]["download_id"], 7)
 
     def test_several_ids_support_one_conclusion_in_given_order(self):
-        outcome = self.assertAccepted({"evidence_ids": [WARRANTY_ID, TITLE_ID, NOTEBOOK_ID]})
+        outcome = self.assertAccepted({"evidence_refs": [WARRANTY_REF, TITLE_REF, NOTEBOOK_REF]})
         self.assertEqual(
             [e["text"] for e in outcome["result"]["evidence"]],
             ["Гарантия 24 месяца.", "Поставка компьютерной техники", "Ноутбук, 10 шт."],
@@ -327,7 +338,7 @@ class ValidResponseTests(unittest.TestCase):
         result = analyzer.deep_analyze(TENDER_CONTEXT, DEEP_ANALYSIS_CONTEXT, TRIAGE_RESULT)
         self.assertEqual(result["evidence"], materialized(TITLE_ID))
         self.assertEqual(result["procurement"]["items"][0]["evidence"], materialized(NOTEBOOK_ID))
-        self.assertNotIn("evidence_ids", json.dumps(result))
+        self.assertNotIn("evidence_refs", json.dumps(result))
 
 
 class ApplicationValidationTests(unittest.TestCase):
@@ -357,21 +368,21 @@ class ApplicationValidationTests(unittest.TestCase):
     def test_missing_evidence_on_item_rejected(self):
         block = procurement_block(items=[{
             "item_name": "Ноутбук", "lot_number": None, "quantity": None, "unit": None,
-            "key_specifications": [], "brand_or_equivalent": None, "evidence_ids": [],
+            "key_specifications": [], "brand_or_equivalent": None, "evidence_refs": [],
         }])
         self.assertRejected(make_response(payload(procurement=block)))
 
     def test_missing_evidence_on_barrier_rejected(self):
         barrier = {
             "type": "certification", "description": "Требуется сертификат",
-            "severity": "high", "evidence_ids": [],
+            "severity": "high", "evidence_refs": [],
         }
         self.assertRejected(make_response(payload(participation_barriers=[barrier])))
 
     def test_unsupported_barrier_type_rejected(self):
         barrier = {
             "type": "needs_a_wizard", "description": "x", "severity": "low",
-            "evidence_ids": [NOTEBOOK_ID],
+            "evidence_refs": [NOTEBOOK_REF],
         }
         self.assertRejected(make_response(payload(participation_barriers=[barrier])))
 
@@ -381,14 +392,15 @@ class ApplicationValidationTests(unittest.TestCase):
     def test_category_forbidden_for_unclear(self):
         self.assertRejected(make_response(payload(**{**UNCLEAR, "category": "computer_equipment"})))
 
-    def test_unknown_evidence_id_rejected(self):
-        error = self.assertRejected(make_response(payload(evidence_ids=["ev_doc_7_ffffff_0000"])))
-        self.assertIn("неизвестный evidence_id", str(error))
+    def test_unknown_evidence_ref_rejected(self):
+        size = len(DEEP_CONTEXT["evidence_catalog"])
+        error = self.assertRejected(make_response(payload(evidence_refs=[size + 1])))
+        self.assertIn("неизвестная ссылка", str(error))
 
-    def test_id_with_altered_suffix_is_not_fuzzy_matched(self):
-        self.assertRejected(make_response(payload(evidence_ids=[NOTEBOOK_ID[:-1] + "9"])))
-        self.assertRejected(make_response(payload(evidence_ids=[NOTEBOOK_ID.upper()])))
-        self.assertRejected(make_response(payload(evidence_ids=[" " + NOTEBOOK_ID])))
+    def test_non_integer_refs_are_not_coerced(self):
+        for bad in ("ev_doc_7_ffffff_0000", NOTEBOOK_REF_STR, 0, -1, 1.0, True, None):
+            with self.subTest(bad=bad):
+                self.assertRejected(make_response(payload(evidence_refs=[bad])))
 
     def test_model_supplied_evidence_text_is_rejected(self):
         # Старый формат v3 (объекты с text) больше не принимается: у модели нет поля evidence.
@@ -396,19 +408,19 @@ class ApplicationValidationTests(unittest.TestCase):
         legacy["evidence"] = [{"source_type": "announcement", "field": "title", "download_id": None,
                                "member_name": None, "text": "Поставка компьютерной техники"}]
         self.assertRejected(make_response(legacy))
-        without_ids = {k: v for k, v in payload().items() if k != "evidence_ids"}
+        without_ids = {k: v for k, v in payload().items() if k != "evidence_refs"}
         self.assertRejected(make_response({**without_ids, "evidence": legacy["evidence"]}))
 
     def test_evidence_object_instead_of_id_rejected(self):
-        self.assertRejected(make_response(payload(evidence_ids=[{"text": "Ноутбук, 10 шт."}])))
+        self.assertRejected(make_response(payload(evidence_refs=[{"text": "Ноутбук, 10 шт."}])))
 
     def test_duplicate_id_in_one_list_rejected(self):
-        error = self.assertRejected(make_response(payload(evidence_ids=[TITLE_ID, TITLE_ID])))
+        error = self.assertRejected(make_response(payload(evidence_refs=[TITLE_REF, TITLE_REF])))
         self.assertIn("повторяется", str(error))
 
-    def test_missing_evidence_ids_on_item_rejected(self):
+    def test_missing_evidence_refs_on_item_rejected(self):
         item = procurement_block()["items"][0]
-        del item["evidence_ids"]
+        del item["evidence_refs"]
         self.assertRejected(make_response(payload(procurement=procurement_block(items=[item]))))
 
     def test_unknown_field_rejected(self):

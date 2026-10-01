@@ -110,8 +110,10 @@ class BuildDeepContextTests(unittest.TestCase):
         )
         user_input = deep_prompt.build_user_input(context)
         self.assertIn("EVIDENCE_CATALOG", user_input)
-        for unit in context["evidence_catalog"]:
-            self.assertIn(f"[{unit['evidence_id']}", user_input)
+        for number, unit in enumerate(context["evidence_catalog"], start=1):
+            self.assertIn(f"{unit['exact_text']}", user_input)
+            self.assertRegex(user_input, rf"\[{number}( key=\w+)?\] ")
+            self.assertNotIn(unit["evidence_id"], user_input)  # канонические ID внутренние
         self.assertEqual(user_input.count("Поставка компьютерной техники"), 1)
         self.assertEqual(user_input.count("Ноутбук, 10 шт."), 1)
         self.assertNotIn('"chunks"', user_input)
@@ -159,13 +161,16 @@ class BuildDeepContextTests(unittest.TestCase):
 
 
 def model_fields(fields) -> set:
-    """Поля model output v4/v5: evidence -> evidence_ids."""
-    return {"evidence_ids" if name == "evidence" else name for name in fields}
+    """Поля model output v7: evidence -> evidence_refs."""
+    return {"evidence_refs" if name == "evidence" else name for name in fields}
+
+
+EVIDENCE_COUNT = 17
 
 
 class SchemaTests(unittest.TestCase):
     def setUp(self):
-        self.schema = deep_prompt.build_deep_output_schema()
+        self.schema = deep_prompt.build_deep_output_schema(EVIDENCE_COUNT)
 
     def test_top_level_fields_match_relevance_schema(self):
         expected = model_fields(relevance_schema.DEEP_ANALYSIS_COMMON_FIELDS)
@@ -222,13 +227,14 @@ class SchemaTests(unittest.TestCase):
         conflict_schema = self.schema["properties"]["source_conflicts"]["items"]
         self.assertEqual(set(conflict_schema["properties"]), set(relevance_schema.SOURCE_CONFLICT_FIELDS))
 
-    def test_every_evidence_field_is_a_list_of_id_strings(self):
+    def test_every_evidence_field_is_a_bounded_list_of_integer_refs(self):
         procurement_item = self.schema["properties"]["procurement"]["properties"]["items"]["items"]
         procurement_lot = self.schema["properties"]["procurement"]["properties"]["lots"]["items"]
         barrier = self.schema["properties"]["participation_barriers"]["items"]
         for container in (self.schema, procurement_item, procurement_lot, barrier):
             self.assertEqual(
-                container["properties"]["evidence_ids"], {"type": "array", "items": {"type": "string"}},
+                container["properties"]["evidence_refs"],
+                {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": EVIDENCE_COUNT}},
             )
 
     def test_schema_has_no_place_for_model_written_evidence_text(self):
@@ -264,20 +270,20 @@ class SchemaTests(unittest.TestCase):
         )
 
     def test_text_format_is_strict_json_schema(self):
-        text_format = deep_prompt.build_text_format()
+        text_format = deep_prompt.build_text_format(EVIDENCE_COUNT)
         self.assertEqual(text_format["format"]["type"], "json_schema")
         self.assertIs(text_format["format"]["strict"], True)
         self.assertEqual(text_format["format"]["schema"], self.schema)
 
     def test_each_call_returns_fresh_dict(self):
-        first = deep_prompt.build_deep_output_schema()
+        first = deep_prompt.build_deep_output_schema(EVIDENCE_COUNT)
         first["properties"]["category"]["type"] = "mutated"
-        self.assertNotEqual(deep_prompt.build_deep_output_schema()["properties"]["category"]["type"], "mutated")
+        self.assertNotEqual(deep_prompt.build_deep_output_schema(EVIDENCE_COUNT)["properties"]["category"]["type"], "mutated")
 
 
 class PromptContentTests(unittest.TestCase):
     def test_prompt_version_is_set(self):
-        self.assertEqual(deep_prompt.DEEP_PROMPT_VERSION, "procurement-deep-v6")
+        self.assertEqual(deep_prompt.DEEP_PROMPT_VERSION, "procurement-deep-v7")
 
     def test_prompt_has_no_unformatted_placeholders(self):
         self.assertNotIn("{", deep_prompt.SYSTEM_PROMPT)
@@ -287,18 +293,23 @@ class PromptContentTests(unittest.TestCase):
         for term in ("profit", "margin", "ROI", "sourcing/logistics/customs cost", "landed cost"):
             self.assertIn(term, deep_prompt.SYSTEM_PROMPT)
 
-    def test_prompt_selects_evidence_by_id_only(self):
+    def test_prompt_selects_evidence_by_numeric_ref_only(self):
         for phrase in (
             "You NEVER write, copy, quote, translate, paraphrase, shorten or reconstruct source text",
-            "Use only IDs that appear literally in EVIDENCE_CATALOG",
-            "Never invent, guess, edit, extend or\n  combine an ID",
-            "One or several IDs may support one conclusion",
+            "Cite evidence using the provided numeric evidence references only",
+            "from 1 through N",
+            "Do not create references",
+            "One or several references may support one conclusion",
             "smallest sufficient set",
-            "the application materializes the exact source text",
-            "may be paraphrased in your own words; evidence is selected only by ID",
-            "evidence_ids",
+            "materializes the exact",
+            "evidence is selected only by number",
+            "evidence_refs",
         ):
             self.assertIn(phrase, deep_prompt.SYSTEM_PROMPT)
+
+    def test_prompt_does_not_mention_canonical_ids_or_group_hashes(self):
+        for forbidden in ("ev_doc", "ev_ann", "ev_enr", "evidence_id", "content_group_id", "content_sha256"):
+            self.assertNotIn(forbidden, deep_prompt.SYSTEM_PROMPT)
 
     def test_prompt_no_longer_asks_for_verbatim_quotes(self):
         for phrase in ("verbatim, contiguous", "SHORTEST sufficient verbatim", "evidence.text"):

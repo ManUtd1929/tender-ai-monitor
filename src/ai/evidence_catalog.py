@@ -4,9 +4,16 @@
 Раньше модель сама воспроизводила evidence.text (дословную цитату), и валидация падала на
 любом неточном символе. Теперь текст источника принадлежит Python: из точных данных, которые
 получает модель (announcement/enrichment поля + текст документов из chunks), строится каталог
-"evidence units" с детерминированными ID. Модель возвращает только evidence_ids; после
-строгой валидации Python материализует человекочитаемый evidence, а text берёт ИСКЛЮЧИТЕЛЬНО
-из каталога, никогда из ответа модели.
+"evidence units" с детерминированными ID.
+
+procurement-deep-v7: модель НЕ воспроизводит строковые ID (live-сбои v5/v6: модель достраивала ID
+16-символьным хешем). Модель-видимый протокол — request-local целочисленные ссылки: unit каталога
+с позицией n (1-based, порядок каталога детерминирован) показывается как "[n] текст", а модель
+возвращает evidence_refs: [n, ...], где 1 <= n <= len(catalog) (границы заданы в strict schema,
+см. deep_prompt.build_deep_output_schema). Ссылка действует только внутри одного запроса и нигде не
+сохраняется как постоянный ID. После строгой валидации (целое, 1..N, без повторов, без clamp/
+fuzzy) Python материализует evidence с каноническим evidence_id и text ИСКЛЮЧИТЕЛЬНО из того же
+объекта каталога, никогда из ответа модели. Канонические evidence_id (ниже) остаются внутренними.
 
 Unit каталога:
     evidence_id, source_type, field, download_id, member_name, content_group_id, key,
@@ -39,7 +46,7 @@ from src.ai import evidence_grounding, relevance_schema
 # Материализованный evidence проходит relevance_schema.validate_evidence_item (<= 500 символов).
 MAX_UNIT_CHARS = relevance_schema.EVIDENCE_TEXT_MAX_CHARS
 
-EVIDENCE_ID_KEY = "evidence_ids"
+EVIDENCE_REFS_KEY = "evidence_refs"
 UNIT_FIELDS = (
     "evidence_id", "source_type", "field", "download_id", "member_name", "content_group_id", "key",
     "exact_text",
@@ -179,16 +186,22 @@ def index_catalog(catalog: list) -> dict:
     return index
 
 
+def evidence_ref_map(catalog: list) -> dict:
+    """{canonical evidence_id: request-local ref (1-based позиция в каталоге)}."""
+    return {unit["evidence_id"]: number for number, unit in enumerate(catalog, start=1)}
+
+
 def render_catalog(catalog: list) -> str:
     """
     Текст каталога для модели. Заголовок [SOURCE ...] повторяется только при смене источника;
-    unit — одна строка "[evidence_id] exact_text" (в exact_text нет "\\n" по построению).
+    unit — одна строка "[n] exact_text", n — request-local ссылка 1..N (в exact_text нет перевода
+    строки по построению). Канонические evidence_id, content_group_id и хеши модели не показываются.
     """
     if not catalog:
         return "(empty: no evidence units are available)"
     lines = []
     current = None
-    for unit in catalog:
+    for number, unit in enumerate(catalog, start=1):
         source = (unit["source_type"], unit["field"], unit["download_id"], unit["member_name"])
         if source != current:
             current = source
@@ -196,37 +209,37 @@ def render_catalog(catalog: list) -> str:
             if unit["source_type"] == "document":
                 header += (
                     f" download_id={unit['download_id']} member_name={json.dumps(unit['member_name'], ensure_ascii=False)}"
-                    f" content_group_id={unit['content_group_id']}"
                 )
             lines.append(header + "]")
-        label = f"{unit['evidence_id']} key={unit['key']}" if unit["key"] is not None else unit["evidence_id"]
+        label = f"{number} key={unit['key']}" if unit["key"] is not None else str(number)
         lines.append(f"[{label}] {unit['exact_text']}")
     return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
-# materialization (model output with evidence_ids -> validated-shape result)
+# materialization (model output with evidence_refs -> validated-shape result)
 # --------------------------------------------------------------------------
 
-def materialize_evidence(evidence_ids, index: dict, what: str) -> list:
+def materialize_evidence(evidence_refs, catalog: list, what: str) -> list:
     """
-    evidence_ids модели -> [{evidence_id, source_type, field, download_id, member_name, text}],
-    text ТОЛЬКО из каталога. ValueError — не list, не строка, неизвестный ID или повтор ID.
-    Никакого fuzzy/semantic сопоставления и автоисправления.
+    evidence_refs модели (целые 1..N) -> [{evidence_id, source_type, field, download_id, member_name,
+    text}], text и канонический evidence_id ТОЛЬКО из каталога. ValueError — не list, не целое
+    (bool и строки отклоняются), ссылка < 1 или > N, повтор ссылки. Никакого clamp/wrap/fuzzy.
     """
-    if not isinstance(evidence_ids, list):
-        raise ValueError(f"{what}.{EVIDENCE_ID_KEY} должен быть list: {evidence_ids!r}")
+    if not isinstance(evidence_refs, list):
+        raise ValueError(f"{what}.{EVIDENCE_REFS_KEY} должен быть list: {evidence_refs!r}")
+    size = len(catalog)
     seen = set()
     materialized = []
-    for evidence_id in evidence_ids:
-        if not isinstance(evidence_id, str):
-            raise ValueError(f"{what}.{EVIDENCE_ID_KEY}: ID должен быть строкой: {evidence_id!r}")
-        if evidence_id in seen:
-            raise ValueError(f"{what}.{EVIDENCE_ID_KEY}: ID повторяется: {evidence_id!r}")
-        seen.add(evidence_id)
-        unit = index.get(evidence_id)
-        if unit is None:
-            raise ValueError(f"{what}.{EVIDENCE_ID_KEY}: неизвестный evidence_id {evidence_id!r}")
+    for ref in evidence_refs:
+        if isinstance(ref, bool) or not isinstance(ref, int):
+            raise ValueError(f"{what}.{EVIDENCE_REFS_KEY}: ссылка должна быть целым числом: {ref!r}")
+        if ref in seen:
+            raise ValueError(f"{what}.{EVIDENCE_REFS_KEY}: ссылка повторяется: {ref!r}")
+        seen.add(ref)
+        if not 1 <= ref <= size:
+            raise ValueError(f"{what}.{EVIDENCE_REFS_KEY}: неизвестная ссылка {ref!r} (допустимо 1..{size})")
+        unit = catalog[ref - 1]
         materialized.append({
             "evidence_id": unit["evidence_id"], "source_type": unit["source_type"], "field": unit["field"],
             "download_id": unit["download_id"], "member_name": unit["member_name"], "text": unit["exact_text"],
@@ -234,46 +247,46 @@ def materialize_evidence(evidence_ids, index: dict, what: str) -> list:
     return materialized
 
 
-def _swap_evidence(container, index: dict, what: str) -> dict:
-    """Копия container, где evidence_ids заменён materialized evidence. Ключа evidence быть не должно."""
+def _swap_evidence(container, catalog: list, what: str) -> dict:
+    """Копия container, где evidence_refs заменён materialized evidence. Ключа evidence быть не должно."""
     if not isinstance(container, dict):
         raise ValueError(f"{what} должен быть dict: {container!r}")
     if "evidence" in container:
-        raise ValueError(f"{what}: модель не должна возвращать evidence с текстом, только {EVIDENCE_ID_KEY}")
-    if EVIDENCE_ID_KEY not in container:
-        raise ValueError(f"{what}: отсутствует обязательное поле {EVIDENCE_ID_KEY!r}")
-    result = {key: value for key, value in container.items() if key != EVIDENCE_ID_KEY}
-    result["evidence"] = materialize_evidence(container[EVIDENCE_ID_KEY], index, what)
+        raise ValueError(f"{what}: модель не должна возвращать evidence с текстом, только {EVIDENCE_REFS_KEY}")
+    if EVIDENCE_REFS_KEY not in container:
+        raise ValueError(f"{what}: отсутствует обязательное поле {EVIDENCE_REFS_KEY!r}")
+    result = {key: value for key, value in container.items() if key != EVIDENCE_REFS_KEY}
+    result["evidence"] = materialize_evidence(container[EVIDENCE_REFS_KEY], catalog, what)
     return result
 
 
-def _swap_list(items, index: dict, what: str) -> list:
+def _swap_list(items, catalog: list, what: str) -> list:
     if not isinstance(items, list):
         raise ValueError(f"{what} должен быть list: {items!r}")
-    return [_swap_evidence(item, index, f"{what}[{position}]") for position, item in enumerate(items)]
+    return [_swap_evidence(item, catalog, f"{what}[{position}]") for position, item in enumerate(items)]
 
 
 def materialize_deep_model_output(raw: dict, catalog: list) -> dict:
     """
-    Raw deep-ответ v4 (evidence_ids везде) -> результат старой формы (evidence = materialized
+    Raw deep-ответ v7 (evidence_refs везде) -> результат старой формы (evidence = materialized
     units), который затем проходит relevance_schema.validate_deep_analysis_result и
-    business-правила. raw не изменяется. ValueError — неизвестный/повторный ID, evidence с
-    текстом от модели или отсутствующий evidence_ids.
+    business-правила. raw не изменяется. ValueError — невалидная/повторная ссылка, evidence с
+    текстом от модели или отсутствующий evidence_refs.
     """
     if not isinstance(raw, dict):
         raise ValueError(f"deep model output должен быть dict: {raw!r}")
-    index = index_catalog(catalog)
+    index_catalog(catalog)  # каталог должен быть однозначным (повторяющийся canonical ID -> ValueError)
 
-    result = _swap_evidence(raw, index, "deep analysis result")
+    result = _swap_evidence(raw, catalog, "deep analysis result")
     result["participation_barriers"] = _swap_list(
-        raw.get("participation_barriers"), index, "participation_barriers",
+        raw.get("participation_barriers"), catalog, "participation_barriers",
     )
     procurement = raw.get("procurement")
     if procurement is not None:
         if not isinstance(procurement, dict):
             raise ValueError(f"procurement должен быть dict или None: {procurement!r}")
         procurement = dict(procurement)
-        procurement["items"] = _swap_list(procurement.get("items"), index, "procurement.items")
-        procurement["lots"] = _swap_list(procurement.get("lots"), index, "procurement.lots")
+        procurement["items"] = _swap_list(procurement.get("items"), catalog, "procurement.items")
+        procurement["lots"] = _swap_list(procurement.get("lots"), catalog, "procurement.lots")
     result["procurement"] = procurement
     return result

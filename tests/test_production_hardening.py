@@ -36,9 +36,9 @@ PERFORMANCE_TEXT = "Обеспечение исполнения договора
 
 
 class BarrierSemanticsPromptTests(unittest.TestCase):
-    def test_prompt_version_is_v6(self):
-        self.assertEqual(deep_prompt.DEEP_PROMPT_VERSION, "procurement-deep-v6")
-        self.assertEqual(openai_deep_analysis.OpenAIDeepAnalysisAnalyzer(environ={}).prompt_version, "procurement-deep-v6")
+    def test_prompt_version_is_v7(self):
+        self.assertEqual(deep_prompt.DEEP_PROMPT_VERSION, "procurement-deep-v7")
+        self.assertEqual(openai_deep_analysis.OpenAIDeepAnalysisAnalyzer(environ={}).prompt_version, "procurement-deep-v7")
 
     def test_prompt_defines_the_three_money_barrier_types_by_purpose(self):
         prompt = " ".join(deep_prompt.SYSTEM_PROMPT.split())
@@ -56,11 +56,11 @@ class BarrierSemanticsPromptTests(unittest.TestCase):
         self.assertIn('securing the participant\'s qualification ->\n  "financial_requirement"', prompt)
         self.assertIn('securing contract performance ->\n  "contract_security"', prompt)
 
-    def test_schema_keeps_barrier_enum_and_evidence_id_architecture(self):
-        schema = deep_prompt.build_deep_output_schema()
+    def test_schema_keeps_barrier_enum_and_evidence_ref_architecture(self):
+        schema = deep_prompt.build_deep_output_schema(10)
         barrier = schema["properties"]["participation_barriers"]["items"]
         self.assertEqual(barrier["properties"]["type"]["enum"], list(relevance_schema.PARTICIPATION_BARRIER_TYPES))
-        self.assertIn("evidence_ids", barrier["properties"])
+        self.assertIn("evidence_refs", barrier["properties"])
         for name in ("bid_security", "contract_security", "financial_requirement"):
             self.assertIn(name, relevance_schema.PARTICIPATION_BARRIER_TYPES)
 
@@ -76,15 +76,16 @@ class BarrierRegressionFixtureTests(unittest.TestCase):
 
     def setUp(self):
         self.context = build([], enrichment={"description": f"{QUALIFICATION_TEXT}\n{PERFORMANCE_TEXT}"})
-        self.qualification_id = by_text(self.context, QUALIFICATION_TEXT)["evidence_id"]
-        self.performance_id = by_text(self.context, PERFORMANCE_TEXT)["evidence_id"]
+        refs = evidence_catalog.evidence_ref_map(self.context["evidence_catalog"])
+        self.qualification_id = refs[by_text(self.context, QUALIFICATION_TEXT)["evidence_id"]]
+        self.performance_id = refs[by_text(self.context, PERFORMANCE_TEXT)["evidence_id"]]
 
     def barrier(self, barrier_type, evidence_id, description):
-        return {"type": barrier_type, "description": description, "severity": "high", "evidence_ids": [evidence_id]}
+        return {"type": barrier_type, "description": description, "severity": "high", "evidence_refs": [evidence_id]}
 
     def validate(self, barriers):
         raw = raw_output(
-            evidence_ids=["ev_ann_title_0"], participation_barriers=barriers, opportunity_type="unclear", category=None,
+            evidence_refs=[1], participation_barriers=barriers, opportunity_type="unclear", category=None,
         )
         materialized = evidence_catalog.materialize_deep_model_output(raw, self.context["evidence_catalog"])
         return relevance_schema.validate_deep_analysis_result(materialized)
@@ -306,7 +307,7 @@ class LedgerMigrationTests(unittest.TestCase):
                  "cache_write_tokens": 40_000, "reasoning_tokens": 200}
         cost = ledger.record_usage(
             "deep", LUNA, usage, reference="https://new.example/1", response_id="resp_new",
-            prompt_version="procurement-deep-v6", now=self._now(), db_path=self.db,
+            prompt_version="procurement-deep-v7", now=self._now(), db_path=self.db,
         )
         expected = (Decimal(50_000) * Decimal("0.20") + Decimal(10_000) * Decimal("0.02")
                     + Decimal(40_000) * Decimal("0.25") + Decimal(1000) * Decimal("1.20")) / 1_000_000
@@ -316,7 +317,7 @@ class LedgerMigrationTests(unittest.TestCase):
                 "SELECT cache_write_tokens, cached_input_tokens, reasoning_tokens, response_id, prompt_version,"
                 " success FROM ai_usage_events WHERE analysis_type = 'deep'"
             ).fetchone()
-        self.assertEqual(row, (40_000, 10_000, 200, "resp_new", "procurement-deep-v6", 1))
+        self.assertEqual(row, (40_000, 10_000, 200, "resp_new", "procurement-deep-v7", 1))
         totals = ledger.monthly_usage(2026, 9, self.db)
         self.assertEqual(totals["cache_write_tokens"], 40_000)
         self.assertEqual(totals["cost_usd"], expected + Decimal("0.000764"))

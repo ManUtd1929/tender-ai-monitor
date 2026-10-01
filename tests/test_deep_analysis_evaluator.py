@@ -382,35 +382,35 @@ class CliRunTests(EvaluatorTestCase):
 class MaterializedArtifactTests(EvaluatorTestCase):
     """Реальный OpenAIDeepAnalysisAnalyzer с fake client: artifact хранит materialized evidence."""
 
-    def run_with_ids(self, evidence_ids):
+    def run_with_ids(self, evidence_refs):
         from tests.test_openai_deep_analysis import FakeClient, make_response, payload
 
         (case,) = self.make_golden(RELEVANT)
-        raw = payload(evidence_ids=evidence_ids, procurement=procurement_block(), category="computer_equipment")
+        raw = payload(evidence_refs=evidence_refs, procurement=procurement_block(), category="computer_equipment")
         client = FakeClient(make_response(raw))
         analyzer = openai_deep_analysis.OpenAIDeepAnalysisAnalyzer(client=client, environ={}, sleep=lambda _: None)
         code, output = self.run_main("--case-id", case["case_id"], analyzer=analyzer)
         return code, output, client, raw
 
-    def test_artifact_contains_materialized_exact_evidence_and_raw_ids(self):
-        code, output, client, raw = self.run_with_ids(["ev_ann_title_0"])
+    def test_artifact_contains_materialized_exact_evidence_and_raw_refs(self):
+        code, output, client, raw = self.run_with_ids([1])
         self.assertEqual(code, 0, output)
         self.assertEqual(len(client.responses.calls), 1)
         (path,) = self.deep_runs_dir.glob("*.json")
         artifact = json.loads(path.read_text(encoding="utf-8"))
         case = artifact["case"]
-        self.assertEqual(artifact["prompt_version"], "procurement-deep-v6")
+        self.assertEqual(artifact["prompt_version"], "procurement-deep-v7")
         (evidence,) = case["prediction"]["evidence"]
         self.assertEqual(evidence["evidence_id"], "ev_ann_title_0")
         self.assertEqual(evidence["source_type"], "announcement")
         self.assertTrue(evidence["text"])  # точный заголовок тендера, взятый из каталога
-        self.assertEqual(case["raw_model_output"]["evidence_ids"], ["ev_ann_title_0"])
+        self.assertEqual(case["raw_model_output"]["evidence_refs"], [1])
         self.assertNotIn("evidence", case["raw_model_output"])
         self.assertGreater(case["evidence_units"], 0)
         self.assertNotIn("evidence_catalog", json.dumps(artifact))
 
-    def test_unknown_id_is_recorded_as_validation_error(self):
-        code, output, _, _ = self.run_with_ids(["ev_doc_1_ffffff_0000"])
+    def test_out_of_range_ref_is_recorded_as_validation_error(self):
+        code, output, _, _ = self.run_with_ids([999999])
         self.assertEqual(code, 1)
         (path,) = self.deep_runs_dir.glob("*.json")
         case = json.loads(path.read_text(encoding="utf-8"))["case"]

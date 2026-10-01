@@ -86,7 +86,7 @@ class FakeDeep(openai_deep_analysis.OpenAIDeepAnalysisAnalyzer):
         if isinstance(outcome, Exception):
             raise outcome
         return {
-            "result": outcome, "raw_model_output": {"evidence_ids": []}, "usage": self.usage,
+            "result": outcome, "raw_model_output": {"evidence_refs": []}, "usage": self.usage,
             "response_id": self.fixed_response_id or f"resp-deep-{len(self.calls)}", "attempts": 1,
         }
 
@@ -160,7 +160,7 @@ class RoutingTests(PipelineTestCase):
         self.assertEqual(state["state"], state_repo.STATE_DEEP_COMPLETED)
         self.assertEqual(state["model"], self.deep.model)
         self.assertEqual(state["details"]["gate"]["gate_decision"], commercial_gate.DEEP_CANDIDATE)
-        self.assertEqual(state["details"]["raw_model_output"], {"evidence_ids": []})
+        self.assertEqual(state["details"]["raw_model_output"], {"evidence_refs": []})
         self.assertEqual(state["details"]["response_id"], "resp-deep-1")
         self.assertIsNotNone(state["details"]["estimated_cost_usd"])
         self.assertEqual(state["details"]["admission"]["deep_analysis_status"], "ready_for_deep")
@@ -432,6 +432,28 @@ class ErrorTests(PipelineTestCase):
         self.assertEqual(self.deep.calls, [url])  # ни Terra, ни повторного Luna с тем же входом
         self.assertEqual(pipeline.select_candidates(), [])
         self.openai_client.assert_not_called()
+
+    def test_validation_failure_persists_raw_output_and_new_prompt_version_allows_one_retry(self):
+        url = self.add(1)
+        raw = {"evidence_refs": [10 ** 6]}
+        self.deep.prompt_version = "procurement-deep-v6"
+        self.deep.outcomes[url] = openai_deep_analysis.DeepAnalysisError(
+            openai_triage.KIND_VALIDATION, "bad ref", usage=USAGE, response_id="r-val", raw_model_output=raw,
+        )
+        pipeline = self.make()
+        pipeline.process_announcement(url)
+        self.assertEqual(self.state(url)["details"]["raw_model_output"], raw)
+
+        pipeline.process_announcement(url)  # тот же hash/model/prompt: известная ошибка, без вызова
+        self.assertEqual(self.deep.calls, [url])
+
+        self.deep.prompt_version = "procurement-deep-v7"  # новая версия протокола: ровно один новый вызов
+        pipeline.process_announcement(url)
+        self.assertEqual(self.deep.calls, [url, url])
+        self.assertEqual(self.state(url)["prompt_version"], "procurement-deep-v7")
+
+        pipeline.process_announcement(url)  # v7 тоже провалился с validation: снова заблокировано
+        self.assertEqual(self.deep.calls, [url, url])
 
     def test_deep_transport_error_is_retried_on_next_run(self):
         url = self.add(1)

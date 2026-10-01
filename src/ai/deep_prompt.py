@@ -14,17 +14,19 @@ relevance). Никакого embeddings/vector search и никакого multi-
 единственный запрос на весь доступный context (правило задачи: "простейшая корректная
 архитектура", "не придумывай silent truncation").
 
-procurement-deep-v4/v5: модель НЕ воспроизводит цитаты. Текст источника (announcement/enrichment
+procurement-deep-v4+: модель НЕ воспроизводит цитаты. Текст источника (announcement/enrichment
 поля + текст документов) превращается в детерминированный evidence catalog
-(src.ai.evidence_catalog) и показывается модели как EVIDENCE_CATALOG с ID; модель возвращает
-только evidence_ids, а Python материализует evidence.text из каталога. chunks в DEEP_CONTEXT
+(src.ai.evidence_catalog) и показывается модели как нумерованный EVIDENCE_CATALOG; модель
+возвращает только ссылки (v7: evidence_refs), а Python материализует evidence.text из каталога. chunks в DEEP_CONTEXT
 больше не отправляются — их текст живёт в каталоге (один раз, с exact-content dedup).
 
-procurement-deep-v6: live-сбой v5 — модель собрала ID сама, подставив 16-символьный хеш из
-content_group_id ("content-fdab79d939c6153e") вместо 6-символьного фрагмента реального ID
-(ev_doc_40_fdab79_0010). Промпт теперь явно требует копировать ID целиком из каталога и
-запрещает строить/удлинять ID из метаданных SOURCE/content_groups. Валидация не менялась:
-неизвестный ID по-прежнему отклоняет весь ответ (без fuzzy-repair).
+procurement-deep-v7: протокол ссылок изменён. Live-сбои v5 и v6: модель строила строковый ID
+из видимого content_group_id (ev_doc_40_fdab79d939c6153e_0010 вместо ev_doc_40_fdab79_0010), даже
+после явного запрета в промпте. Теперь модель видит каталог как "[n] текст" (n = 1..N, request-local)
+и возвращает evidence_refs: integer[]; strict schema ограничивает каждое значение minimum=1,
+maximum=N (N = размер ТЕКУЩЕГО каталога, см. build_deep_output_schema). Канонические evidence_id и
+content_group_id/content_sha256 остаются внутренними и модели не показываются. Валидация строгая:
+не целое / <1 / >N / повтор — отказ всего ответа, без clamp и fuzzy-repair.
 
 procurement-deep-v5: тот же evidence-ID контракт, что и v4; изменена только семантика типов
 participation barrier (financial_requirement / bid_security / contract_security различаются
@@ -42,7 +44,7 @@ import json
 
 from src.ai import evidence_catalog, evidence_grounding, relevance_schema, triage_prompt
 
-DEEP_PROMPT_VERSION = "procurement-deep-v6"
+DEEP_PROMPT_VERSION = "procurement-deep-v7"
 
 DEEP_OUTPUT_NAME = "tender_deep_analysis"
 
@@ -84,20 +86,21 @@ INPUT (DEEP_CONTEXT, JSON)
 - documents: metadata of every document known for this tender (download_id, member_name,
   file_type, extraction_status).
 - EVIDENCE_CATALOG (after DEEP_CONTEXT): the exact source text, split into evidence units.
-  Each unit is one line "[evidence_id] exact text" (dictionary fields also show "key=<name>"
-  after the ID). "[SOURCE type=... field=... download_id=... member_name=...
-  content_group_id=...]" lines say where the following units come from. Units of one document
-  are in reading order, so consecutive IDs are consecutive lines/rows of that document. A
+  Each unit is one numbered line "[n] exact text" (dictionary fields also show "key=<name>"
+  after the number), where n is the unit's evidence reference, an integer from 1 through N
+  (N = the unit count printed in the EVIDENCE_CATALOG header). "[SOURCE type=... field=...
+  download_id=... member_name=...]" lines say where the following units come from. Units of one
+  document are in reading order, so consecutive numbers are consecutive lines/rows of that document. A
   document with no units and not listed in content_groups was not successfully extracted (see
   document_coverage) — never invent its content.
 - content_groups / document_content_stats: documents whose extracted text is byte-for-byte
-  identical are sent ONCE. Each content group has content_group_id, canonical_source (the
+  identical are sent ONCE. Each content group has canonical_source (the
   download_id/member_name whose evidence units carry the text) and represented_sources (ALL documents
   that contain exactly this text, including the canonical one). If a group has several
   represented_sources, the same content was found in every one of those documents (e.g. the
   same table repeated in per-lot files); do not treat it as a single document and do not
-  assume those documents differ. Evidence units exist only for the canonical_source (their
-  content_group_id matches the group); select them for any of the represented documents.
+  assume those documents differ. Evidence units exist only for the canonical_source (see the
+  SOURCE lines); select them for any of the represented documents.
   document_content_stats counts total_documents_with_text,
   unique_content_groups and duplicate_documents.
 
@@ -131,7 +134,7 @@ procurement (required when opportunity_type="procurement", must be null for "unc
   key_specifications (list of short strings, only requirements actually present: dimensions,
   power, capacity, material, standards, model/compatibility, functional features, packaging,
   condition, year, completeness, etc. — never "common sense" additions),
-  brand_or_equivalent (see below; item-specific), evidence_ids (required,
+  brand_or_equivalent (see below; item-specific), evidence_refs (required,
   non-empty: an item cannot be listed without supporting evidence).
 - lots: when the tender has many lots, do not force everything into one item. Provide a
   lot-level summary instead (lot_number, description, item_count) rather than enumerating every
@@ -155,7 +158,7 @@ procurement (required when opportunity_type="procurement", must be null for "unc
 
 participation_barriers: only barriers the material actually confirms, one of {barrier_types}.
   Each barrier needs: type, description (Russian, what the material actually requires),
-  severity (high/medium/low — how much it could block participation), evidence_ids (required,
+  severity (high/medium/low — how much it could block participation), evidence_refs (required,
   non-empty). A routine, generic procurement-law clause is NOT a tender-specific barrier.
   Money-related barrier types differ by WHAT the money secures — choose by that meaning, and give
   each distinct requirement exactly ONE type (do not report the same requirement under several
@@ -184,32 +187,28 @@ source_conflicts: use when announcement/enrichment and the documents materially 
 logistics: always null in this MVP (deep analysis of logistics tenders is a separate stage not
   enabled yet).
 
-EVIDENCE (applies to the top-level evidence_ids AND to every item/lot/barrier evidence_ids)
+EVIDENCE (applies to the top-level evidence_refs AND to every item/lot/barrier evidence_refs)
 You NEVER write, copy, quote, translate, paraphrase, shorten or reconstruct source text as
-evidence. The application owns all source text: every evidence unit in EVIDENCE_CATALOG has an
-ID such as ev_ann_title_0 or ev_doc_22_a1b2c3_0042. You support a conclusion by returning the
-ID(s) of the unit(s) that prove it, and the application materializes the exact source text
-from those IDs itself.
-- Use only IDs that appear literally in EVIDENCE_CATALOG. Never invent, guess, edit, extend or
-  combine an ID; never output a page number, quote text, file name, download id or chunk id in
-  place of an ID.
-- COPY each evidence_id EXACTLY, character for character, from the "[evidence_id]" bracket of the
-  catalog line that proves the fact. An ID is an opaque token: never construct one from parts and
-  never modify its hash fragment (in a document ID it is exactly 6 hex characters, e.g.
-  "ev_doc_22_a1b2c3_0042" - do not lengthen or replace it). SOURCE-header and content_groups
-  metadata (download_id, member_name, content_group_id, content_sha256) are NOT parts of an ID:
-  never infer or build an ID from them, even though a content_group_id hash may begin with the same
-  characters as the fragment inside an ID.
-- One or several IDs may support one conclusion. Select the smallest sufficient set of units
-  (normally one to three); do not pad it with loosely related units. Do not repeat an ID inside
-  one evidence_ids list.
+evidence. The application owns all source text: every evidence unit in EVIDENCE_CATALOG has a
+number n. You support a conclusion by returning the number(s) of the unit(s) that prove it, as
+integers in evidence_refs (for example [4, 11, 27]), and the application materializes the exact
+source text from those numbers itself.
+- Cite evidence using the provided numeric evidence references only. A reference is an integer
+  from 1 through N, where N is the unit count of EVIDENCE_CATALOG. Do not create references:
+  never output a number that is not printed in brackets in EVIDENCE_CATALOG; never output a page
+  number, quote text, file name, download id or any other identifier in place of a reference.
+- Every claim that needs evidence (every item, lot, barrier and the top-level evidence_refs) must
+  cite the relevant numbered unit(s).
+- One or several references may support one conclusion. Select the smallest sufficient set of
+  units (normally one to three); do not pad it with loosely related units. Do not repeat a
+  reference inside one evidence_refs list.
 - Choose the unit that itself proves the fact (for a table, the row that states it). If the
-  proof spans neighbouring lines/rows, list those consecutive IDs.
+  proof spans neighbouring lines/rows, list those consecutive numbers.
 - Conclusions (summary, why_interesting, descriptions, key_specifications, missing_information
-  and so on) may be paraphrased in your own words; evidence is selected only by ID.
-- Application code rejects the whole answer if any ID is unknown or repeated, or if a required
-  evidence_ids list (item, barrier) is empty. Explanations belong in summary/why_interesting/
-  reason-like fields, not in evidence_ids.
+  and so on) may be paraphrased in your own words; evidence is selected only by number.
+- Application code rejects the whole answer if any reference is out of range or repeated, or if a
+  required evidence_refs list (item, barrier) is empty. Explanations belong in summary/
+  why_interesting/reason-like fields, not in evidence_refs.
 
 {no_hallucination_rules}
 
@@ -307,23 +306,29 @@ def build_deep_context(tender_context: dict, deep_analysis_context: dict, triage
 # --------------------------------------------------------------------------
 
 def _model_fields(fields: tuple) -> tuple:
-    """Поля deep-результата в ответе модели v4: evidence (объекты с text) -> evidence_ids."""
-    return tuple(evidence_catalog.EVIDENCE_ID_KEY if name == "evidence" else name for name in fields)
+    """Поля deep-результата в ответе модели v7: evidence (объекты с text) -> evidence_refs."""
+    return tuple(evidence_catalog.EVIDENCE_REFS_KEY if name == "evidence" else name for name in fields)
 
 
-def _evidence_ids_schema() -> dict:
-    """Только ID из EVIDENCE_CATALOG: в схеме нет ни одного поля с текстом цитаты."""
-    return {"type": "array", "items": {"type": "string"}}
+def _evidence_refs_schema(evidence_count: int) -> dict:
+    """
+    Только целые ссылки 1..N на units текущего каталога (без enum и без полей с текстом цитаты).
+    Пустой каталог: ссылок быть не может — maxItems=0 (minimum/maximum 1..0 была бы невалидной
+    схемой); обязательные evidence-списки тогда не пройдут application validation.
+    """
+    if evidence_count < 1:
+        return {"type": "array", "items": {"type": "integer"}, "maxItems": 0}
+    return {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": evidence_count}}
 
 
-def _barrier_schema() -> dict:
+def _barrier_schema(evidence_count: int) -> dict:
     return {
         "type": "object",
         "properties": {
             "type": {"type": "string", "enum": list(relevance_schema.PARTICIPATION_BARRIER_TYPES)},
             "description": {"type": "string"},
             "severity": {"type": "string", "enum": list(relevance_schema.CONFIDENCE_LEVELS)},
-            "evidence_ids": _evidence_ids_schema(),
+            "evidence_refs": _evidence_refs_schema(evidence_count),
         },
         "required": list(_model_fields(relevance_schema.PARTICIPATION_BARRIER_FIELDS)),
         "additionalProperties": False,
@@ -346,7 +351,7 @@ def _source_conflict_schema() -> dict:
     }
 
 
-def _procurement_item_schema() -> dict:
+def _procurement_item_schema(evidence_count: int) -> dict:
     return {
         "type": "object",
         "properties": {
@@ -356,21 +361,21 @@ def _procurement_item_schema() -> dict:
             "unit": {"type": _STRING_OR_NULL},
             "key_specifications": {"type": "array", "items": {"type": "string"}},
             "brand_or_equivalent": _brand_or_equivalent_schema(),
-            "evidence_ids": _evidence_ids_schema(),
+            "evidence_refs": _evidence_refs_schema(evidence_count),
         },
         "required": list(_model_fields(relevance_schema.PROCUREMENT_ITEM_FIELDS)),
         "additionalProperties": False,
     }
 
 
-def _procurement_lot_schema() -> dict:
+def _procurement_lot_schema(evidence_count: int) -> dict:
     return {
         "type": "object",
         "properties": {
             "lot_number": {"type": "string"},
             "description": {"type": _STRING_OR_NULL},
             "item_count": {"type": _INTEGER_OR_NULL},
-            "evidence_ids": _evidence_ids_schema(),
+            "evidence_refs": _evidence_refs_schema(evidence_count),
         },
         "required": list(_model_fields(relevance_schema.PROCUREMENT_LOT_FIELDS)),
         "additionalProperties": False,
@@ -389,7 +394,7 @@ def _brand_or_equivalent_schema() -> dict:
     }
 
 
-def _procurement_block_schema() -> dict:
+def _procurement_block_schema(evidence_count: int) -> dict:
     string_or_null_fields = (
         "subject", "quantity_summary", "delivery_location", "delivery_deadline",
         "warranty", "estimated_value_amd",
@@ -397,8 +402,8 @@ def _procurement_block_schema() -> dict:
     properties = {name: {"type": _STRING_OR_NULL} for name in string_or_null_fields}
     properties["total_lots"] = {"type": _INTEGER_OR_NULL}
     properties["brand_or_equivalent"] = _brand_or_equivalent_schema()
-    properties["items"] = {"type": "array", "items": _procurement_item_schema()}
-    properties["lots"] = {"type": "array", "items": _procurement_lot_schema()}
+    properties["items"] = {"type": "array", "items": _procurement_item_schema(evidence_count)}
+    properties["lots"] = {"type": "array", "items": _procurement_lot_schema(evidence_count)}
     for name in ("technical_requirements", "country_of_origin_requirements", "certifications"):
         properties[name] = {"type": "array", "items": {"type": "string"}}
     return {
@@ -409,13 +414,14 @@ def _procurement_block_schema() -> dict:
     }
 
 
-def build_deep_output_schema() -> dict:
+def build_deep_output_schema(evidence_count: int) -> dict:
     """
     Strict JSON schema (Structured Outputs) для deep-analysis результата. Procurement-only
     MVP: opportunity_type ограничен DEEP_MVP_OPPORTUNITY_TYPES, logistics — фиксированный
     null (тип "null"). Комбинация opportunity_type <-> procurement (null для "unclear")
     strict schema не выражает — это application validation (src.ai.openai_deep_analysis),
-    как и в triage_prompt. Каждый вызов возвращает новый dict.
+    как и в triage_prompt. evidence_count — размер ТЕКУЩЕГО evidence catalog (максимум ссылки).
+    Каждый вызов возвращает новый dict.
     """
     properties = {
         "summary": {"type": "string"},
@@ -425,12 +431,12 @@ def build_deep_output_schema() -> dict:
         "contracting_authority": {"type": _STRING_OR_NULL},
         "procedure_code": {"type": _STRING_OR_NULL},
         "confidence": {"type": "string", "enum": list(relevance_schema.CONFIDENCE_LEVELS)},
-        "participation_barriers": {"type": "array", "items": _barrier_schema()},
+        "participation_barriers": {"type": "array", "items": _barrier_schema(evidence_count)},
         "missing_information": {"type": "array", "items": {"type": "string"}},
         "source_conflicts": {"type": "array", "items": _source_conflict_schema()},
         "manual_review_required": {"type": "boolean"},
-        "evidence_ids": _evidence_ids_schema(),
-        "procurement": _procurement_block_schema() | {"type": _OBJECT_OR_NULL},
+        "evidence_refs": _evidence_refs_schema(evidence_count),
+        "procurement": _procurement_block_schema(evidence_count) | {"type": _OBJECT_OR_NULL},
         "logistics": {"type": "null"},
     }
     return {
@@ -441,13 +447,13 @@ def build_deep_output_schema() -> dict:
     }
 
 
-def build_text_format() -> dict:
+def build_text_format(evidence_count: int) -> dict:
     """Параметр text= для Responses API: Structured Outputs со strict JSON schema."""
     return {
         "format": {
             "type": "json_schema",
             "name": DEEP_OUTPUT_NAME,
-            "schema": build_deep_output_schema(),
+            "schema": build_deep_output_schema(evidence_count),
             "strict": True,
         }
     }
@@ -459,6 +465,9 @@ _CATALOG_COVERED_KEYS = (
 )
 
 
+_INTERNAL_GROUP_KEYS = ("content_group_id", "content_sha256")
+
+
 def serialize_deep_context(deep_context: dict) -> str:
     """
     Детерминированная сериализация метаданных DEEP_CONTEXT (см. triage_prompt аналог). Без
@@ -468,13 +477,19 @@ def serialize_deep_context(deep_context: dict) -> str:
         key: value for key, value in deep_context.items()
         if key != "evidence_catalog" and key not in _CATALOG_COVERED_KEYS
     }
+    # content_group_id/content_sha256 — внутренняя provenance/dedup-метаданная: модели они не нужны и
+    # были источником ложных ID (v5/v6), поэтому в видимом контексте их нет.
+    metadata["content_groups"] = [
+        {key: value for key, value in group.items() if key not in _INTERNAL_GROUP_KEYS}
+        for group in deep_context.get("content_groups") or []
+    ]
     return json.dumps(
         metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
     )
 
 
 def build_user_input(deep_context: dict) -> str:
-    """Текст запроса: DEEP_CONTEXT (метаданные) + EVIDENCE_CATALOG (точный текст с ID)."""
+    """Текст запроса: DEEP_CONTEXT (метаданные) + EVIDENCE_CATALOG (точный текст, нумерованные units)."""
     catalog = deep_context["evidence_catalog"]
     return (
         "DEEP_CONTEXT (JSON):\n" + serialize_deep_context(deep_context)

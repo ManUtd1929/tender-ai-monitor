@@ -1,6 +1,6 @@
 """
-Тесты src.ai.evidence_catalog (procurement-deep-v4): детерминированные evidence ID, состав
-каталога, строгая материализация evidence_ids -> evidence с текстом из каталога, dedup.
+Тесты src.ai.evidence_catalog (procurement-deep-v4+/v7): детерминированные канонические evidence ID, состав
+каталога, строгая материализация numeric evidence_refs -> evidence с текстом из каталога, dedup.
 Сети и OpenAI нет.
 
 Запуск из корня проекта:
@@ -33,12 +33,12 @@ def by_text(context, text):
 
 
 def raw_output(**overrides) -> dict:
-    """Минимальный model output v4 (evidence_ids везде)."""
+    """Минимальный model output v7 (evidence_refs везде)."""
     output = {
         "summary": "s", "opportunity_type": "procurement", "category": "medical_equipment",
         "why_interesting": "w", "contracting_authority": None, "procedure_code": None,
         "confidence": "high", "participation_barriers": [], "missing_information": [],
-        "source_conflicts": [], "manual_review_required": False, "evidence_ids": [],
+        "source_conflicts": [], "manual_review_required": False, "evidence_refs": [],
         "procurement": None, "logistics": None,
     }
     output.update(overrides)
@@ -162,10 +162,8 @@ class UnitTests(unittest.TestCase):
 
     def test_every_unit_fits_materialized_evidence_validation(self):
         context = build([make_document("a.docx", "x" * 1300, file_type="docx")])
-        for unit in context["evidence_catalog"]:
-            evidence = evidence_catalog.materialize_evidence(
-                [unit["evidence_id"]], evidence_catalog.index_catalog(context["evidence_catalog"]), "t",
-            )[0]
+        for number, unit in enumerate(context["evidence_catalog"], start=1):
+            evidence = evidence_catalog.materialize_evidence([number], context["evidence_catalog"], "t")[0]
             relevance_schema.validate_deep_evidence_item(evidence)
 
     def test_unicode_text_is_kept_exactly(self):
@@ -215,111 +213,116 @@ class MaterializeTests(unittest.TestCase):
             enrichment={"description": "Требуется сертификат ISO 13485"},
         )
         self.catalog = self.context["evidence_catalog"]
-        self.row = by_text(self.context, "Item 3\t3 pcs")["evidence_id"]
-        self.cert = by_text(self.context, "Требуется сертификат ISO 13485")["evidence_id"]
-        self.title = "ev_ann_title_0"
+        self.refs = evidence_catalog.evidence_ref_map(self.catalog)
+        self.row_id = by_text(self.context, "Item 3\t3 pcs")["evidence_id"]
+        self.cert_id = by_text(self.context, "Требуется сертификат ISO 13485")["evidence_id"]
+        self.title_id = "ev_ann_title_0"
+        self.row, self.cert, self.title = (self.refs[i] for i in (self.row_id, self.cert_id, self.title_id))
 
     def materialize(self, **overrides):
         return evidence_catalog.materialize_deep_model_output(raw_output(**overrides), self.catalog)
 
     def test_returns_exact_original_text_from_catalog(self):
-        result = self.materialize(evidence_ids=[self.row, self.cert, self.title])
+        result = self.materialize(evidence_refs=[self.row, self.cert, self.title])
         self.assertEqual(result["evidence"], [
-            {"evidence_id": self.row, "source_type": "document", "field": "text", "download_id": 5,
+            {"evidence_id": self.row_id, "source_type": "document", "field": "text", "download_id": 5,
              "member_name": "lot_1.xlsx", "text": "Item 3\t3 pcs"},
-            {"evidence_id": self.cert, "source_type": "enrichment", "field": "description",
+            {"evidence_id": self.cert_id, "source_type": "enrichment", "field": "description",
              "download_id": None, "member_name": None, "text": "Требуется сертификат ISO 13485"},
-            {"evidence_id": self.title, "source_type": "announcement", "field": "title",
+            {"evidence_id": self.title_id, "source_type": "announcement", "field": "title",
              "download_id": None, "member_name": None, "text": "Medical equipment"},
         ])
-        self.assertNotIn("evidence_ids", result)
+        self.assertNotIn("evidence_refs", result)
 
     def test_materialized_result_passes_relevance_validation(self):
-        result = self.materialize(evidence_ids=[self.row], opportunity_type="unclear", category=None)
+        result = self.materialize(evidence_refs=[self.row], opportunity_type="unclear", category=None)
         validated = relevance_schema.validate_deep_analysis_result(result)
-        self.assertEqual(validated["evidence"][0]["evidence_id"], self.row)
+        self.assertEqual(validated["evidence"][0]["evidence_id"], self.row_id)
         self.assertEqual(validated["evidence"][0]["text"], "Item 3\t3 pcs")
 
     def test_top_level_barrier_item_and_lot_ids_are_materialized(self):
-        barrier = {"type": "certification", "description": "d", "severity": "high", "evidence_ids": [self.cert]}
+        barrier = {"type": "certification", "description": "d", "severity": "high", "evidence_refs": [self.cert]}
         item = {
             "item_name": "Monitor", "lot_number": "1", "quantity": "1", "unit": "pcs",
-            "key_specifications": [], "brand_or_equivalent": None, "evidence_ids": [self.row, self.title],
+            "key_specifications": [], "brand_or_equivalent": None, "evidence_refs": [self.row, self.title],
         }
-        lot = {"lot_number": "1", "description": None, "item_count": 1, "evidence_ids": [self.row]}
+        lot = {"lot_number": "1", "description": None, "item_count": 1, "evidence_refs": [self.row]}
         procurement = {name: None for name in relevance_schema.PROCUREMENT_SCALAR_FIELDS}
         procurement.update({name: [] for name in relevance_schema.PROCUREMENT_LIST_FIELDS})
         procurement.update(brand_or_equivalent=None, items=[item], lots=[lot])
         result = self.materialize(
-            evidence_ids=[self.title], participation_barriers=[barrier], procurement=procurement,
+            evidence_refs=[self.title], participation_barriers=[barrier], procurement=procurement,
         )
         validated = relevance_schema.validate_deep_analysis_result(result)
         self.assertEqual([e["text"] for e in validated["evidence"]], ["Medical equipment"])
         self.assertEqual(validated["participation_barriers"][0]["evidence"][0]["text"], "Требуется сертификат ISO 13485")
-        self.assertEqual([e["evidence_id"] for e in validated["procurement"]["items"][0]["evidence"]], [self.row, self.title])
+        self.assertEqual([e["evidence_id"] for e in validated["procurement"]["items"][0]["evidence"]], [self.row_id, self.title_id])
         self.assertEqual(validated["procurement"]["lots"][0]["evidence"][0]["text"], "Item 3\t3 pcs")
 
     def test_inputs_are_not_mutated(self):
-        raw = raw_output(evidence_ids=[self.row])
+        raw = raw_output(evidence_refs=[self.row])
         before = copy.deepcopy((raw, self.catalog))
         evidence_catalog.materialize_deep_model_output(raw, self.catalog)
         self.assertEqual((raw, self.catalog), before)
 
-    def test_unknown_id_rejected(self):
-        with self.assertRaisesRegex(ValueError, "неизвестный evidence_id"):
-            self.materialize(evidence_ids=["ev_doc_5_000000_9999"])
+    def test_out_of_range_refs_rejected(self):
+        size = len(self.catalog)
+        for bad in (0, -1, size + 1, 10 ** 9):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "неизвестная ссылка"):
+                self.materialize(evidence_refs=[bad])
 
-    def test_id_from_another_tender_rejected(self):
-        other = build([make_document("other.xlsx", "Completely different tender row", download_id=99)])
-        foreign = by_text(other, "Completely different tender row")["evidence_id"]
-        self.assertNotIn(foreign, {u["evidence_id"] for u in self.catalog})
-        with self.assertRaisesRegex(ValueError, "неизвестный evidence_id"):
-            self.materialize(evidence_ids=[foreign])
+    def test_boundaries_are_valid(self):
+        result = self.materialize(evidence_refs=[1, len(self.catalog)])
+        self.assertEqual(
+            [e["evidence_id"] for e in result["evidence"]],
+            [self.catalog[0]["evidence_id"], self.catalog[-1]["evidence_id"]],
+        )
 
-    def test_no_fuzzy_matching_or_repair(self):
-        for bad in (self.row.upper(), " " + self.row, self.row + " ", self.row[:-1], self.row + "0", ""):
+    def test_no_fuzzy_matching_wrap_or_clamp(self):
+        size = len(self.catalog)
+        for bad in (str(self.row), self.row_id, " 1", "1 ", 1.0, 1.5, True, False, size + 1, 0):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
-                self.materialize(evidence_ids=[bad])
+                self.materialize(evidence_refs=[bad])
 
     def test_duplicate_id_in_one_list_rejected(self):
         with self.assertRaisesRegex(ValueError, "повторяется"):
-            self.materialize(evidence_ids=[self.row, self.row])
+            self.materialize(evidence_refs=[self.row, self.row])
 
-    def test_non_string_and_non_list_ids_rejected(self):
-        for bad in ([{"text": "Item 3"}], [1], [None], "ev_ann_title_0", None):
+    def test_non_integer_and_non_list_refs_rejected(self):
+        for bad in ([{"text": "Item 3"}], ["ev_ann_title_0"], ["1"], [None], 1, "ev_ann_title_0", None):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
-                self.materialize(evidence_ids=bad)
+                self.materialize(evidence_refs=bad)
 
     def test_model_written_evidence_text_is_rejected(self):
         evidence = [{"source_type": "announcement", "field": "title", "download_id": None,
                      "member_name": None, "text": "Medical equipment"}]
-        with self.assertRaisesRegex(ValueError, "только evidence_ids"):
+        with self.assertRaisesRegex(ValueError, "только evidence_refs"):
             evidence_catalog.materialize_deep_model_output({**raw_output(), "evidence": evidence}, self.catalog)
         item = {"item_name": "x", "lot_number": None, "quantity": None, "unit": None, "key_specifications": [],
-                "brand_or_equivalent": None, "evidence_ids": [self.row], "evidence": evidence}
+                "brand_or_equivalent": None, "evidence_refs": [self.row], "evidence": evidence}
         procurement = {name: None for name in relevance_schema.PROCUREMENT_SCALAR_FIELDS}
         procurement.update({name: [] for name in relevance_schema.PROCUREMENT_LIST_FIELDS})
         procurement.update(brand_or_equivalent=None, items=[item])
-        with self.assertRaisesRegex(ValueError, "только evidence_ids"):
+        with self.assertRaisesRegex(ValueError, "только evidence_refs"):
             self.materialize(procurement=procurement)
 
-    def test_missing_evidence_ids_rejected_at_every_level(self):
+    def test_missing_evidence_refs_rejected_at_every_level(self):
         raw = raw_output()
-        del raw["evidence_ids"]
-        with self.assertRaisesRegex(ValueError, "evidence_ids"):
+        del raw["evidence_refs"]
+        with self.assertRaisesRegex(ValueError, "evidence_refs"):
             evidence_catalog.materialize_deep_model_output(raw, self.catalog)
         barrier = {"type": "certification", "description": "d", "severity": "high"}
-        with self.assertRaisesRegex(ValueError, "evidence_ids"):
+        with self.assertRaisesRegex(ValueError, "evidence_refs"):
             self.materialize(participation_barriers=[barrier])
 
     def test_business_rule_empty_item_and_barrier_evidence_still_rejected(self):
-        barrier = {"type": "certification", "description": "d", "severity": "high", "evidence_ids": []}
+        barrier = {"type": "certification", "description": "d", "severity": "high", "evidence_refs": []}
         with self.assertRaises(ValueError):
             relevance_schema.validate_deep_analysis_result(self.materialize(participation_barriers=[barrier]))
 
-    def test_empty_catalog_rejects_any_id(self):
+    def test_empty_catalog_rejects_any_ref(self):
         with self.assertRaises(ValueError):
-            evidence_catalog.materialize_deep_model_output(raw_output(evidence_ids=["ev_ann_title_0"]), [])
+            evidence_catalog.materialize_deep_model_output(raw_output(evidence_refs=[1]), [])
 
     def test_duplicate_catalog_ids_are_rejected(self):
         unit = self.catalog[0]
@@ -333,7 +336,9 @@ class RenderTests(unittest.TestCase):
         text = evidence_catalog.render_catalog(context["evidence_catalog"])
         self.assertIn("[SOURCE type=announcement field=title]", text)
         self.assertIn('[SOURCE type=document field=text download_id=8 member_name="a.xlsx"', text)
-        self.assertIn("[ev_enr_dates_0 key=deadline_at_detail] 2026-02-01", text)
+        self.assertRegex(text, r"\[\d+ key=deadline_at_detail\] 2026-02-01")
+        self.assertNotIn("ev_", text)
+        self.assertNotIn("content", text)
         self.assertEqual(text.count("[SOURCE type=document"), 1)
 
     def test_render_empty_catalog(self):

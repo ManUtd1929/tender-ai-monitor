@@ -10,9 +10,9 @@ deep_analysis_context, triage_result) -> dict. triage() здесь намере�
 STAGE 1, отдельный модуль).
 
 Ответ разбирается json.loads без чистки markdown/code fences. procurement-deep-v4: модель
-возвращает не цитаты, а evidence_ids; src.ai.evidence_catalog строго материализует их в
-evidence с текстом ТОЛЬКО из детерминированного каталога (неизвестный/повторный ID -> ошибка
-валидации, без fuzzy и автоисправления), затем результат проходит
+возвращает не цитаты, а целые evidence_refs (v7, 1..N, границы в strict schema);
+src.ai.evidence_catalog строго материализует их в evidence с каноническим ID и текстом ТОЛЬКО из
+того же каталога (ссылка вне 1..N/не целое/повтор -> ошибка валидации, без fuzzy и автоисправления), затем результат проходит
 relevance_schema.validate_deep_analysis_result и MVP-правила этого модуля (opportunity_type
 ограничен procurement/unclear, category snake_case для procurement и null для unclear).
 Grounding обеспечен построением: текст evidence не приходит от модели.
@@ -222,7 +222,7 @@ class OpenAIDeepAnalysisAnalyzer:
             "instructions": deep_prompt.SYSTEM_PROMPT,
             "input": deep_prompt.build_user_input(deep_context),
             "reasoning": {"effort": self.reasoning_effort},
-            "text": deep_prompt.build_text_format(),
+            "text": deep_prompt.build_text_format(len(deep_context["evidence_catalog"])),
             "store": False,
         }
         if self.max_output_tokens is not None:
@@ -245,7 +245,7 @@ class OpenAIDeepAnalysisAnalyzer:
     def deep_analyze_with_metadata(self, tender_context: dict, deep_analysis_context: dict, triage_result: dict) -> dict:
         """
         {"result": validated deep-analysis dict (evidence материализован из каталога),
-        "raw_model_output": dict (ответ модели с evidence_ids), "usage": dict | None,
+        "raw_model_output": dict (ответ модели с evidence_refs), "usage": dict | None,
         "response_id": str | None, "attempts": int}. DeepAnalysisError (см. KIND_*) — любая ошибка; usage/response_id/
         attempts прикладываются, если известны.
         """

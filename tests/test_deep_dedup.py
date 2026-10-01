@@ -216,12 +216,12 @@ class BrandEquivalentTests(unittest.TestCase):
         self.assertIsNone(tender_wide["items"][0]["brand_or_equivalent"] if tender_wide["items"] else None)
 
     def test_output_schema_has_item_brand_required(self):
-        schema = deep_prompt.build_deep_output_schema()
+        schema = deep_prompt.build_deep_output_schema(10)
         item_schema = schema["properties"]["procurement"]["properties"]["items"]["items"]
         self.assertIn("brand_or_equivalent", item_schema["required"])
         self.assertEqual(
             set(item_schema["properties"]),
-            {"evidence_ids" if name == "evidence" else name for name in relevance_schema.PROCUREMENT_ITEM_FIELDS},
+            {"evidence_refs" if name == "evidence" else name for name in relevance_schema.PROCUREMENT_ITEM_FIELDS},
         )
 
 
