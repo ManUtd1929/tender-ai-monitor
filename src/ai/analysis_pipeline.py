@@ -47,6 +47,7 @@ CLI:
 import argparse
 import dataclasses
 import logging
+import os
 import sqlite3
 import sys
 from contextlib import closing
@@ -67,6 +68,8 @@ from src.database.tender_repository import DEFAULT_DB_PATH, resolve_db_path
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+AI_ANALYSIS_BATCH_LIMIT_ENV = "AI_ANALYSIS_BATCH_LIMIT"
 
 # Ошибки содержимого ответа: с тем же (hash, prompt, model) повтор дал бы тот же класс ошибки и
 # снова стоил бы денег. Транспортные (timeout/rate_limit/api_error/config/auth) повторяются.
@@ -782,8 +785,13 @@ class AnalysisPipeline:
         results, state_counts = [], {}
         api_calls = {"triage": 0, "deep": 0}
         accounting_blocked = False
+        ledger_before = self._ledger_max_id()
         for candidate in candidates:
             if accounting_blocked:
+                logger.critical(
+                    "AI batch остановлен: accounting-блок, новые платные вызовы не начаты; "
+                    "остаток кандидатов перейдёт на следующий запуск после reconcile"
+                )
                 break
             try:
                 outcome = self.process_announcement(candidate["resource_url"])
@@ -810,7 +818,30 @@ class AnalysisPipeline:
             "candidate_count": len(candidates), "processed_count": len(results),
             "failed_count": len(failures), "state_counts": state_counts, "api_calls": api_calls,
             "results": results, "failures": failures, "accounting_blocked": accounting_blocked,
+            "batch_cost_usd": self._ledger_cost_since(ledger_before),
         }
+
+    def _ledger_max_id(self) -> int | None:
+        try:
+            with closing(sqlite3.connect(resolve_db_path(self.db_path))) as conn:
+                return conn.execute("SELECT COALESCE(MAX(id), 0) FROM ai_usage_events").fetchone()[0]
+        except Exception:
+            logger.warning("Не удалось прочитать ledger до batch; стоимость batch будет неизвестна", exc_info=True)
+            return None
+
+    def _ledger_cost_since(self, before_id: int | None) -> str | None:
+        """Фактическая стоимость этого batch по ledger (строка Decimal) или None, если недоступна."""
+        if before_id is None:
+            return None
+        try:
+            with closing(sqlite3.connect(resolve_db_path(self.db_path))) as conn:
+                rows = conn.execute(
+                    "SELECT estimated_cost_usd FROM ai_usage_events WHERE id > ?", (before_id,)
+                ).fetchall()
+            return str(sum((Decimal(r[0]) for r in rows), Decimal(0)))
+        except Exception:
+            logger.warning("Не удалось прочитать стоимость batch из ledger", exc_info=True)
+            return None
 
 
 # --------------------------------------------------------------------------
@@ -832,13 +863,75 @@ def build_analyzers(settings: BudgetSettings, environ=None):
 
 
 def run_ai_analysis(db_path=None, limit: int | None = None, environ=None) -> dict:
-    """Реальный запуск для monitor (только при AI_ANALYSIS_ENABLED=true). Без OPENAI_API_KEY не вызывает ничего."""
+    """
+    Реальный запуск AI batch. limit=None = без лимита: monitor так НЕ вызывает (см. run_monitor_ai_batch).
+    Без OPENAI_API_KEY не вызывает ничего.
+    """
     settings = load_budget_settings(environ)
     triage, deep = build_analyzers(settings, environ)
     if not (triage.has_api_key and deep.has_api_key):
         logger.error("AI analysis пропущен: OPENAI_API_KEY не задан")
         return {"status": "skipped_no_api_key"}
     return AnalysisPipeline(triage, deep, settings, db_path=db_path).process_batch(limit)
+
+
+class BatchLimitConfigError(ValueError):
+    """AI_ANALYSIS_BATCH_LIMIT отсутствует или некорректен: AI в monitor не запускается (fail-safe)."""
+
+
+def load_monitor_batch_limit(environ=None) -> int:
+    """
+    Лимит тендеров на ОДИН запуск monitor (не дневной и не бизнес-лимит). Обязателен: нет значения,
+    не целое, <= 0 -> BatchLimitConfigError. Молчаливого «без лимита» нет.
+    """
+    environ = os.environ if environ is None else environ
+    raw = (environ.get(AI_ANALYSIS_BATCH_LIMIT_ENV) or "").strip()
+    if not raw:
+        raise BatchLimitConfigError(f"{AI_ANALYSIS_BATCH_LIMIT_ENV} не задан (обязателен при AI_ANALYSIS_ENABLED=true)")
+    try:
+        value = int(raw)
+    except ValueError:
+        raise BatchLimitConfigError(f"{AI_ANALYSIS_BATCH_LIMIT_ENV} должен быть целым числом: {raw!r}") from None
+    if value <= 0:
+        raise BatchLimitConfigError(f"{AI_ANALYSIS_BATCH_LIMIT_ENV} должен быть > 0: {raw!r}")
+    return value
+
+
+def summarize_monitor_batch(batch: dict, limit: int) -> dict:
+    """Компактная сводка автоматического batch для monitor result/log (без секретов)."""
+    results = batch["results"]
+    states = [r.get("state") for r in results]
+    count = states.count
+    return {
+        "status": "ok", "ai_enabled": True, "batch_limit": limit,
+        "selected": batch["candidate_count"], "processed": batch["processed_count"],
+        "triage_api_calls": batch["api_calls"]["triage"], "deep_api_calls": batch["api_calls"]["deep"],
+        "deep_completed": count(state_repo.STATE_DEEP_COMPLETED),
+        "not_relevant": count(state_repo.STATE_STOPPED_NOT_RELEVANT),
+        "errors": len(batch["failures"]),
+        "escalations": count(state_repo.STATE_ESCALATION_CANDIDATE),
+        "budget_deferred": count(state_repo.STATE_TRIAGE_DEFERRED_BUDGET) + count(state_repo.STATE_DEEP_DEFERRED_BUDGET),
+        "accounting_blocked": batch["accounting_blocked"],
+        "batch_cost_usd": batch.get("batch_cost_usd"),
+    }
+
+
+def run_monitor_ai_batch(db_path=None, environ=None) -> dict:
+    """
+    Production-вход AI для monitor: ровно один batch не более AI_ANALYSIS_BATCH_LIMIT тендеров, затем СТОП
+    (остаток backlog — следующему запуску). Без корректного лимита ничего не создаётся и не вызывается.
+    """
+    try:
+        limit = load_monitor_batch_limit(environ)
+    except BatchLimitConfigError as error:
+        logger.error("AI-анализ не запущен: %s", error)
+        return {"status": "config_error", "ai_enabled": True, "batch_limit": None, "error_message": str(error)}
+    batch = run_ai_analysis(db_path=db_path, limit=limit, environ=environ)
+    if "results" not in batch:  # например skipped_no_api_key
+        return {"ai_enabled": True, "batch_limit": limit, **batch}
+    summary = summarize_monitor_batch(batch, limit)
+    logger.info("AI batch (monitor): %s", summary)
+    return summary
 
 
 def _add_triage_preflight(total: dict, pre: dict) -> None:

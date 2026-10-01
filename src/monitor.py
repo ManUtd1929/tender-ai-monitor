@@ -114,8 +114,8 @@ def ai_analysis_enabled() -> bool:
 
 def _run_ai_analysis_if_enabled() -> dict | None:
     """
-    AI-анализ после enrichment/документов. Выключен (None, никаких импортов analyzers и client) пока
-    AI_ANALYSIS_ENABLED не true. Ошибка AI-стадии не прерывает мониторинг.
+    AI-анализ после enrichment/документов: один batch не более AI_ANALYSIS_BATCH_LIMIT тендеров.
+    Выключен (None, никаких импортов analyzers и client) пока AI_ANALYSIS_ENABLED не true. Ошибка AI-стадии не прерывает мониторинг.
     """
     if not ai_analysis_enabled():
         logger.info("AI-анализ выключен (%s не включён)", AI_ANALYSIS_ENV)
@@ -123,7 +123,7 @@ def _run_ai_analysis_if_enabled() -> dict | None:
     from src.ai import analysis_pipeline  # ленивый импорт: при выключенном флаге AI-код не загружается
 
     try:
-        return analysis_pipeline.run_ai_analysis()
+        return analysis_pipeline.run_monitor_ai_batch()  # батч с AI_ANALYSIS_BATCH_LIMIT, не unlimited
     except Exception as error:
         logger.exception("AI-анализ завершился ошибкой; мониторинг продолжается")
         return {"status": "error", "error_type": type(error).__name__, "error_message": str(error)}

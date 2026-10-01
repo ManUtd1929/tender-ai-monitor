@@ -236,7 +236,7 @@ class RunMonitorTest(unittest.TestCase):
         from src.ai import analysis_pipeline
 
         for value in (None, "", "false", "0"):
-            with self.subTest(value=value), self.run_with_ai_env(value),                  mock.patch.object(analysis_pipeline, "run_ai_analysis") as run_ai,                  mock.patch.object(analysis_pipeline, "build_analyzers") as build,                  mock.patch("openai.OpenAI") as client:
+            with self.subTest(value=value), self.run_with_ai_env(value),                  mock.patch.object(analysis_pipeline, "run_monitor_ai_batch") as run_ai,                  mock.patch.object(analysis_pipeline, "build_analyzers") as build,                  mock.patch("openai.OpenAI") as client:
                 result = monitor.run_monitor()
 
             self.assertIsNone(result["ai_analysis"])
@@ -250,7 +250,7 @@ class RunMonitorTest(unittest.TestCase):
         order = []
         self.process_documents.side_effect = lambda candidates: order.append("documents") or make_document_result()
         with self.run_with_ai_env("true"), mock.patch.object(
-            analysis_pipeline, "run_ai_analysis", side_effect=lambda: order.append("ai") or {"processed_count": 0},
+            analysis_pipeline, "run_monitor_ai_batch", side_effect=lambda: order.append("ai") or {"processed_count": 0},
         ):
             result = monitor.run_monitor()
 
@@ -261,7 +261,7 @@ class RunMonitorTest(unittest.TestCase):
         from src.ai import analysis_pipeline
 
         with self.run_with_ai_env("true"), mock.patch.object(
-            analysis_pipeline, "run_ai_analysis", side_effect=RuntimeError("boom"),
+            analysis_pipeline, "run_monitor_ai_batch", side_effect=RuntimeError("boom"),
         ):
             result = monitor.run_monitor()
 
