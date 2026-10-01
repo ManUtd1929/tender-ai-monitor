@@ -508,7 +508,9 @@ class AnalysisPipeline:
             self._save_state(
                 url, state, input_hash, analyzer, reason_code=error.kind, error_kind=error.kind,
                 escalation_reason=escalation_reason, message=str(error),
-                details={**details, "usage": error.usage, "response_id": error.response_id, "attempts": error.attempts},
+                details={**details, "usage": error.usage, "response_id": error.response_id, "attempts": error.attempts,
+                         **({"raw_model_output": error.raw_model_output}
+                            if getattr(error, "raw_model_output", None) is not None else {})},
             )
             return self._finish(outcome, state, error.kind, str(error), escalation_reason=escalation_reason)
 

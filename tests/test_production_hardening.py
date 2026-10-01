@@ -36,9 +36,9 @@ PERFORMANCE_TEXT = "Обеспечение исполнения договора
 
 
 class BarrierSemanticsPromptTests(unittest.TestCase):
-    def test_prompt_version_is_v5(self):
-        self.assertEqual(deep_prompt.DEEP_PROMPT_VERSION, "procurement-deep-v5")
-        self.assertEqual(openai_deep_analysis.OpenAIDeepAnalysisAnalyzer(environ={}).prompt_version, "procurement-deep-v5")
+    def test_prompt_version_is_v6(self):
+        self.assertEqual(deep_prompt.DEEP_PROMPT_VERSION, "procurement-deep-v6")
+        self.assertEqual(openai_deep_analysis.OpenAIDeepAnalysisAnalyzer(environ={}).prompt_version, "procurement-deep-v6")
 
     def test_prompt_defines_the_three_money_barrier_types_by_purpose(self):
         prompt = " ".join(deep_prompt.SYSTEM_PROMPT.split())
@@ -306,7 +306,7 @@ class LedgerMigrationTests(unittest.TestCase):
                  "cache_write_tokens": 40_000, "reasoning_tokens": 200}
         cost = ledger.record_usage(
             "deep", LUNA, usage, reference="https://new.example/1", response_id="resp_new",
-            prompt_version="procurement-deep-v5", now=self._now(), db_path=self.db,
+            prompt_version="procurement-deep-v6", now=self._now(), db_path=self.db,
         )
         expected = (Decimal(50_000) * Decimal("0.20") + Decimal(10_000) * Decimal("0.02")
                     + Decimal(40_000) * Decimal("0.25") + Decimal(1000) * Decimal("1.20")) / 1_000_000
@@ -316,7 +316,7 @@ class LedgerMigrationTests(unittest.TestCase):
                 "SELECT cache_write_tokens, cached_input_tokens, reasoning_tokens, response_id, prompt_version,"
                 " success FROM ai_usage_events WHERE analysis_type = 'deep'"
             ).fetchone()
-        self.assertEqual(row, (40_000, 10_000, 200, "resp_new", "procurement-deep-v5", 1))
+        self.assertEqual(row, (40_000, 10_000, 200, "resp_new", "procurement-deep-v6", 1))
         totals = ledger.monthly_usage(2026, 9, self.db)
         self.assertEqual(totals["cache_write_tokens"], 40_000)
         self.assertEqual(totals["cost_usd"], expected + Decimal("0.000764"))

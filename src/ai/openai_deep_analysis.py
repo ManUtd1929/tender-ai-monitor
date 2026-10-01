@@ -68,7 +68,15 @@ CATEGORY_PATTERN = openai_triage.CATEGORY_PATTERN
 
 
 class DeepAnalysisError(openai_triage.TriageError):
-    """Ошибка deep-analysis вызова. Та же форма, что и TriageError (kind/usage/response_id/attempts)."""
+    """
+    Ошибка deep-analysis вызова. Та же форма, что и TriageError (kind/usage/response_id/attempts);
+    raw_model_output — разобранный JSON ответа модели, если ответ получен и разобран, но не прошёл
+    валидацию (для диагностики; не используется как результат).
+    """
+
+    def __init__(self, kind: str, message: str, *, raw_model_output=None, **details):
+        super().__init__(kind, message, **details)
+        self.raw_model_output = raw_model_output
 
 
 # --------------------------------------------------------------------------
@@ -299,4 +307,6 @@ class OpenAIDeepAnalysisAnalyzer:
             materialized = evidence_catalog.materialize_deep_model_output(raw, deep_context["evidence_catalog"])
             return raw, validate_mvp_deep_analysis_result(materialized)
         except ValueError as error:
-            raise DeepAnalysisError(KIND_VALIDATION, f"Application validation: {error}", **details) from error
+            raise DeepAnalysisError(
+                KIND_VALIDATION, f"Application validation: {error}", raw_model_output=raw, **details,
+            ) from error

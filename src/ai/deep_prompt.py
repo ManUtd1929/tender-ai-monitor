@@ -20,6 +20,12 @@ procurement-deep-v4/v5: модель НЕ воспроизводит цитат�
 только evidence_ids, а Python материализует evidence.text из каталога. chunks в DEEP_CONTEXT
 больше не отправляются — их текст живёт в каталоге (один раз, с exact-content dedup).
 
+procurement-deep-v6: live-сбой v5 — модель собрала ID сама, подставив 16-символьный хеш из
+content_group_id ("content-fdab79d939c6153e") вместо 6-символьного фрагмента реального ID
+(ev_doc_40_fdab79_0010). Промпт теперь явно требует копировать ID целиком из каталога и
+запрещает строить/удлинять ID из метаданных SOURCE/content_groups. Валидация не менялась:
+неизвестный ID по-прежнему отклоняет весь ответ (без fuzzy-repair).
+
 procurement-deep-v5: тот же evidence-ID контракт, что и v4; изменена только семантика типов
 participation barrier (financial_requirement / bid_security / contract_security различаются
 по тому, ЧТО именно обеспечивается — это смысл для модели, а не постобработка ответа по ключевым словам).
@@ -36,7 +42,7 @@ import json
 
 from src.ai import evidence_catalog, evidence_grounding, relevance_schema, triage_prompt
 
-DEEP_PROMPT_VERSION = "procurement-deep-v5"
+DEEP_PROMPT_VERSION = "procurement-deep-v6"
 
 DEEP_OUTPUT_NAME = "tender_deep_analysis"
 
@@ -187,6 +193,13 @@ from those IDs itself.
 - Use only IDs that appear literally in EVIDENCE_CATALOG. Never invent, guess, edit, extend or
   combine an ID; never output a page number, quote text, file name, download id or chunk id in
   place of an ID.
+- COPY each evidence_id EXACTLY, character for character, from the "[evidence_id]" bracket of the
+  catalog line that proves the fact. An ID is an opaque token: never construct one from parts and
+  never modify its hash fragment (in a document ID it is exactly 6 hex characters, e.g.
+  "ev_doc_22_a1b2c3_0042" - do not lengthen or replace it). SOURCE-header and content_groups
+  metadata (download_id, member_name, content_group_id, content_sha256) are NOT parts of an ID:
+  never infer or build an ID from them, even though a content_group_id hash may begin with the same
+  characters as the fragment inside an ID.
 - One or several IDs may support one conclusion. Select the smallest sufficient set of units
   (normally one to three); do not pad it with loosely related units. Do not repeat an ID inside
   one evidence_ids list.

@@ -277,7 +277,7 @@ class SchemaTests(unittest.TestCase):
 
 class PromptContentTests(unittest.TestCase):
     def test_prompt_version_is_set(self):
-        self.assertEqual(deep_prompt.DEEP_PROMPT_VERSION, "procurement-deep-v5")
+        self.assertEqual(deep_prompt.DEEP_PROMPT_VERSION, "procurement-deep-v6")
 
     def test_prompt_has_no_unformatted_placeholders(self):
         self.assertNotIn("{", deep_prompt.SYSTEM_PROMPT)

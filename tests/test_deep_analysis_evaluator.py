@@ -399,7 +399,7 @@ class MaterializedArtifactTests(EvaluatorTestCase):
         (path,) = self.deep_runs_dir.glob("*.json")
         artifact = json.loads(path.read_text(encoding="utf-8"))
         case = artifact["case"]
-        self.assertEqual(artifact["prompt_version"], "procurement-deep-v5")
+        self.assertEqual(artifact["prompt_version"], "procurement-deep-v6")
         (evidence,) = case["prediction"]["evidence"]
         self.assertEqual(evidence["evidence_id"], "ev_ann_title_0")
         self.assertEqual(evidence["source_type"], "announcement")

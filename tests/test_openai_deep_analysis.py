@@ -159,7 +159,7 @@ class SettingsTests(unittest.TestCase):
         analyzer = openai_deep_analysis.OpenAIDeepAnalysisAnalyzer(client=FakeClient(), environ={})
         self.assertEqual(analyzer.model, "gpt-5.6-luna")
         self.assertEqual(analyzer.reasoning_effort, "high")
-        self.assertEqual(analyzer.prompt_version, "procurement-deep-v5")
+        self.assertEqual(analyzer.prompt_version, "procurement-deep-v6")
 
     def test_shared_openai_model_env_var_is_used(self):
         analyzer = openai_deep_analysis.OpenAIDeepAnalysisAnalyzer(
