@@ -2,7 +2,7 @@
 Детерминированная Telegram-карточка тендера (HTML parse mode) из СОХРАНЁННОГО deep result.
 
 Без БД, сети и AI: функция получает уже готовые данные. Пустые секции и значения None не выводятся,
-evidence в карточку не попадает, длинные списки обрезаются ("... и ещё N"), весь текст экранируется
+evidence в карточку не попадает, длинные списки обрезаются (строка "Показано X из Y"), весь текст экранируется
 (& < >), чтобы название тендера/заказчика не ломало разметку.
 """
 
@@ -91,7 +91,43 @@ def _bullets(values, max_items: int, max_chars: int) -> list[str]:
     cleaned = [text for text in (_clean(v) for v in values) if text]
     lines = [f"• {_esc(_clip(text, max_chars))}" for text in cleaned[:max_items]]
     if len(cleaned) > max_items:
-        lines.append(f"... и ещё {len(cleaned) - max_items}")
+        lines.append(f"Показано {max_items} из {len(cleaned)}")
+    return lines
+
+
+_DANGLING = {
+    "и", "или", "а", "но", "что", "чтобы", "как", "для", "в", "во", "на", "с", "со", "по", "к", "ко", "от",
+    "из", "о", "об", "при", "за", "до", "у", "не", "что-либо", "также", "а также", "где", "когда", "если",
+}
+
+
+def _dangling(text: str) -> bool:
+    words = text.rstrip(" ,;:-–—.").split()
+    return not words or words[-1].lower() in _DANGLING
+
+
+def _complete_sentence(text: str, max_chars: int) -> str | None:
+    """
+    Законченная мысль не длиннее max_chars: целое предложение, либо часть до запятой/точки с запятой
+    (с точкой в конце), либо None. Новое содержание не добавляется.
+    """
+    if len(text) <= max_chars:
+        return text
+    head = text[:max_chars]
+    cuts = [m.start() for m in re.finditer(r"[,;](?=\s)", head)]
+    for cut in reversed(cuts):
+        part = head[:cut].rstrip(" ,;:-–—")
+        if len(part) >= max_chars * 0.4 and not _dangling(part):
+            return part + "."
+    return None
+
+
+def _why_bullets(value, max_items: int, max_chars: int) -> list[str]:
+    sentences = [p for p in _SENTENCE_END.split(_clean(value) or "") if p]
+    complete = [c for c in (_complete_sentence(p, max_chars) for p in sentences) if c]
+    lines = [f"• {_esc(c)}" for c in complete[:max_items]]
+    if lines and len(sentences) > len(lines):
+        lines.append(f"Показано {len(lines)} из {len(sentences)}")
     return lines
 
 
@@ -140,11 +176,6 @@ def _quantity_lines(procurement: dict) -> list[str]:
     return lines
 
 
-def _why_lines(value) -> list[str]:
-    text = _clean(value)
-    return [p for p in _SENTENCE_END.split(text) if p][:MAX_WHY] if text else []
-
-
 def _barrier_texts(barriers) -> list[str]:
     valid = [b for b in barriers or [] if isinstance(b, dict)]
     valid.sort(key=lambda b: SEVERITY_ORDER.get(b.get("severity"), 3))  # стабильно: сначала серьёзные
@@ -181,7 +212,7 @@ def _build(result: dict, resource_url, deadline, value_amd, max_items: int, max_
         _section("Что закупают:", _bullets(_what_is_procured(procurement, logistics), min(MAX_ITEMS, max_items), max_chars)),
         _section("Количество / лоты:", [_esc(_clip(t, max_chars)) for t in _quantity_lines(procurement)]),
         one("Оценочная стоимость:", format_value_amd(value_amd)),
-        _section("Почему может быть интересно:", _bullets(_why_lines(result.get("why_interesting")), MAX_WHY, max_chars)),
+        _section("Почему может быть интересно:", _why_bullets(result.get("why_interesting"), MAX_WHY, max_chars)),
         _section("Ключевые требования:", _bullets(requirements, min(MAX_REQUIREMENTS, max_items), max_chars)),
         _section("⚠️ Барьеры участия:", _bullets(_barrier_texts(result.get("participation_barriers")),
                                                   min(MAX_BARRIERS, max_items), max_chars)),

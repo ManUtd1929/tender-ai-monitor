@@ -337,9 +337,10 @@ class MessageTests(unittest.TestCase):
                 "procurement": {**FULL_RESULT["procurement"],
                                 "items": [{"item_name": f"Товар {n}"} for n in range(30)]}}
         text = message.build_card(many, self.URL)
-        self.assertIn("... и ещё 25", text)  # items: 30 - 5
-        self.assertIn("... и ещё 8", text)  # missing: 12 - 4
-        self.assertIn("... и ещё 6", text)  # barriers: 9 - 3
+        self.assertIn("Показано 5 из 30", text)  # items
+        self.assertIn("Показано 4 из 12", text)  # missing
+        self.assertIn("Показано 3 из 9", text)  # barriers
+        self.assertNotIn("и ещё", text)
         self.assertNotIn("Товар 5", text)
         self.assertLessEqual(len(text), message.TELEGRAM_MESSAGE_LIMIT)
 
@@ -401,8 +402,32 @@ class CompactCardTests(unittest.TestCase):
         self.assertEqual(_bullet_count(text, "⚠️ Барьеры"), 3)
         self.assertEqual(_bullet_count(text, "❓ Нужно уточнить"), 4)
         self.assertEqual(_bullet_count(text, "Что закупают"), 5)
-        for expected in ("... и ещё 6", "... и ещё 5", "... и ещё 4"):
+        for expected in ("Показано 3 из 9", "Показано 4 из 9", "Показано 5 из 9"):
             self.assertIn(expected, text)
+        self.assertNotIn("и ещё", text)
+
+    def test_full_list_has_no_shown_line(self):
+        text = self.card(missing_information=["Вопрос 1", "Вопрос 2"],
+                         participation_barriers=[{"description": "Б1"}],
+                         procurement={"technical_requirements": ["Т1", "Т2", "Т3"],
+                                      "items": [{"item_name": f"Товар {n}"} for n in range(5)]},
+                         why_interesting="Первое. Второе.")
+        self.assertNotIn("Показано", text)
+        self.assertNotIn("и ещё", text)
+
+    def test_why_interesting_keeps_complete_thoughts(self):
+        why = ("Закупаются физические товары для озеленения территорий, что потенциально соответствует "
+               "поставщикам питомников и садовых центров региона. Короткое второе предложение.")
+        text = self.card(why_interesting=why)
+        section = next(p for p in text.split("\n\n") if p.startswith("<b>Почему"))
+        for line in section.split("\n")[1:]:
+            self.assertFalse(line.endswith("..."), line)
+            body = line.removeprefix("• ").rstrip(".")
+            self.assertNotIn(body.split()[-1].lower(), ("и", "или", "что", "для"), line)
+        small = message._why_bullets(why, 2, 100)
+        self.assertEqual(small[0], "• Закупаются физические товары для озеленения территорий.")
+        self.assertIn("• Короткое второе предложение.", small)
+        self.assertEqual(message._why_bullets("Очень " * 30 + "длинное предложение без запятых.", 2, 60), [])
 
     def test_why_interesting_limited_and_optional(self):
         why = "Первое. Второе! Третье? Четвёртое."
