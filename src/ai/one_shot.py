@@ -3,6 +3,11 @@
 
     python -m src.ai.analysis_pipeline --run-one "<URL>"                       # preflight, без вызовов
     python -m src.ai.analysis_pipeline --run-one "<URL>" --confirm-paid-call   # реальный запуск
+    python -m src.ai.analysis_pipeline --run-one "<URL>" --allow-expired --confirm-paid-call   # истёкший срок
+
+Истёкший срок (Operational Eligibility) по умолчанию останавливает тендер до любого платного вызова даже с
+--confirm-paid-call. --allow-expired обходит ТОЛЬКО этот deadline-гейт; BudgetGuard, accounting, резервы,
+лимит Deep input, идемпотентность, валидация и Commercial Gate работают как обычно.
 
 Здесь нет AI-логики: вызывается существующий AnalysisPipeline.process_announcement(url) (идемпотентность,
 Commercial Gate, резервы, ledger, BudgetGuard остаются в нём). Никакого выбора backlog / process_batch.
@@ -14,13 +19,28 @@ import sqlite3
 from contextlib import closing
 from decimal import Decimal
 
-from src.ai import commercial_gate, deep_admission, deep_prompt, preflight, pricing
+from src.ai import commercial_gate, deep_admission, deep_prompt, operational_eligibility, preflight, pricing
 from src.ai import tender_context as tender_context_module
 from src.ai.analysis_pipeline import AnalysisPipeline, _ReadOnlyStore, _stage_is_current
 from src.ai.budget_guard import ANALYSIS_TRIAGE
 from src.database import ai_usage_repository, tender_repository
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 2
+
+
+def _print_operational_eligibility(ctx, now, allow_expired, out) -> operational_eligibility.Eligibility:
+    eligibility = operational_eligibility.evaluate_context(ctx, now)
+    out("Operational Eligibility:")
+    out(f"  status: {eligibility.status}")
+    out(f"  resolved deadline: {eligibility.resolved_deadline.isoformat() if eligibility.resolved_deadline else '-'}")
+    for source, raw, parsed in eligibility.deadline_sources:
+        out(f"  deadline source: {source} = {raw!r} -> {parsed or 'не распознано'}")
+    if not eligibility.deadline_sources:
+        out("  deadline source: нет значений (срок неизвестен, пропуск запрещён)")
+    out(f"  evaluation time: {eligibility.evaluated_at.isoformat()}")
+    out(f"  expired: {str(eligibility.expired).lower()}")
+    out(f"  operator override (--allow-expired): {str(allow_expired).lower()}")
+    return eligibility
 
 
 def _print_triage_preflight(url, triage, deep, settings, store, ctx, input_hash, out) -> bool:
@@ -124,7 +144,10 @@ def _print_report(url, outcome, rows, db_path, out) -> None:
     out(f"  outstanding reservations after run: {len(reserved)}")
 
 
-def run_one(resource_url, triage, deep, settings, db_path=None, confirm=False, out=print) -> int:
+def run_one(
+    resource_url, triage, deep, settings, db_path=None, confirm=False, out=print, allow_expired=False,
+    clock=operational_eligibility.utc_now,
+) -> int:
     """Код возврата: 0 — ok / preflight-only, 1 — пайплайн завершился ошибкой, 2 — ошибка запуска (вызовов нет)."""
     db_path = tender_repository.resolve_db_path(db_path)  # один раз; дальше везде уже resolved Path, не None
     try:
@@ -138,14 +161,19 @@ def run_one(resource_url, triage, deep, settings, db_path=None, confirm=False, o
 
     ctx = tender_context_module.build_tender_context(resource_url, db_path=db_path)
     input_hash = tender_context_module.compute_input_hash(ctx)
+    eligibility = _print_operational_eligibility(ctx, clock(), allow_expired, out)
     if not _print_triage_preflight(resource_url, triage, deep, settings, store, ctx, input_hash, out):
         return EXIT_USAGE
     if not confirm:
         out("DRY-RUN: платных вызовов нет, OpenAI client не создан. Для реального запуска добавьте --confirm-paid-call")
         return EXIT_OK
 
+    if eligibility.expired and not allow_expired:
+        out("Срок подачи истёк: НОВЫЕ платные вызовы не выполняются. Исторический платный запуск: "
+            "--allow-expired --confirm-paid-call (BudgetGuard и остальные ограничения остаются).")
     pipeline = AnalysisPipeline(
         triage, deep, settings, db_path=db_path, gate=_gate_with_deep_preflight(deep, settings, store, out),
+        clock=clock, allow_expired=allow_expired,
     )
     pipeline._ensure_ready()
     before = _max_event_id(db_path)

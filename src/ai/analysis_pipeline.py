@@ -28,13 +28,19 @@ docstring), поэтому maybe проходит тот же Gate; relevance_st
 блокирующее условие не изменится; детерминированные ошибки содержимого (validation/refusal/...) с тем же
 (hash, prompt, model) повторно не оплачиваются.
 
+Operational Eligibility Gate (src.ai.operational_eligibility): детерминированная проверка срока подачи ДО
+любого НОВОГО платного вызова (triage и Deep). Надёжно истёкший срок -> состояние skipped_expired
+(reason deadline_expired), $0: ни резерва, ни анализатора, ни client. Уже сохранённые triage/deep
+результаты не удаляются и переиспользуются как раньше; пересчёт идёт каждый раз из текущих полей, поэтому
+продление срока (меняет input_hash) само возвращает тендер в работу. unknown/conflict НЕ пропускаются.
+
 Terra НЕ вызывается: причина эскалации только записывается (src.ai.escalation).
 OpenAI client здесь не создаётся: analyzers инъектируются (в тестах — fakes), а production-analyzers
 создают client лениво при первом реальном вызове. Dry-run не вызывает и не создаёт ничего платного.
 
 CLI:
     python -m src.ai.analysis_pipeline --dry-run [--limit N]
-    python -m src.ai.analysis_pipeline --run-one "<URL>" [--confirm-paid-call]   (см. src.ai.one_shot)
+    python -m src.ai.analysis_pipeline --run-one "<URL>" [--confirm-paid-call] [--allow-expired]   (см. src.ai.one_shot)
 """
 
 import argparse
@@ -48,7 +54,8 @@ from decimal import Decimal
 from pathlib import Path
 
 from src.ai import (
-    commercial_gate, deep_admission, deep_prompt, escalation, openai_triage, preflight, pricing,
+    commercial_gate, deep_admission, deep_prompt, escalation, openai_triage, operational_eligibility, preflight,
+    pricing,
 )
 from src.ai import tender_context as tender_context_module
 from src.ai.budget_guard import ANALYSIS_DEEP, ANALYSIS_TRIAGE, BudgetGuard
@@ -81,6 +88,9 @@ REASON_ACCOUNTING_BLOCKED = "accounting_blocked"
 OUTCOME_ACCOUNTING_BLOCKED = "accounting_blocked"
 
 # Причины, по которым тендер попадает в batch (в порядке приоритета: сначала новые, потом retry).
+# needs_routing — переиспользование без вызова ($0), истёкший срок ему не мешает.
+PAID_WORK_REASONS = ("needs_triage", "retry_triage", "needs_deep", "retry_deep")
+REASON_SKIP_EXPIRED = "skip_expired"  # причина кандидата (в БД не пишется): нужен только $0-учёт состояния
 FRESH_REASONS = ("needs_triage", "needs_routing", "needs_deep")
 RETRY_REASONS = ("retry_triage", "retry_deep")
 
@@ -242,6 +252,7 @@ class AnalysisPipeline:
     def __init__(
         self, triage_analyzer, deep_analyzer, settings: BudgetSettings, db_path=None,
         gate=commercial_gate.evaluate, pricing_overrides: dict | None = None, store=None,
+        clock=operational_eligibility.utc_now, allow_expired: bool = False,
     ):
         self.triage_analyzer = triage_analyzer
         self.deep_analyzer = deep_analyzer
@@ -250,6 +261,8 @@ class AnalysisPipeline:
         self.gate = gate
         self.pricing_overrides = pricing_overrides
         self.guard = BudgetGuard(settings)
+        self.clock = clock  # инъектируемые часы: aware datetime; бизнес-логика не вызывает datetime.now()
+        self.allow_expired = allow_expired  # операторский override ТОЛЬКО deadline-гейта (one-shot)
         self.store = store if store is not None else _RepositoryStore(db_path)
         self._ready = False
         # Резерв на случай, когда даже запись блока в БД не удалась: тогда этот экземпляр больше не платит.
@@ -388,6 +401,28 @@ class AnalysisPipeline:
     def _blocked_outcome(self, outcome, url, reason):
         logger.error("Платный вызов не начат (accounting fail-closed): %s — %s", url, reason)
         return self._finish(outcome, OUTCOME_ACCOUNTING_BLOCKED, REASON_ACCOUNTING_BLOCKED, reason)
+
+    # -- operational eligibility ----------------------------------------------
+
+    def _expired_blocks_new_call(self, eligibility) -> bool:
+        return eligibility.expired and not self.allow_expired
+
+    def _skip_expired(self, url, input_hash, eligibility, outcome) -> dict:
+        """Срок надёжно истёк: $0-состояние для ЭТОГО набора данных. Не необратимо: пересчитывается из источников."""
+        facts = eligibility.to_dict()
+        message = f"срок подачи истёк: {facts['resolved_deadline']} (проверено {facts['evaluated_at']})"
+        logger.info("Тендер пропущен без AI (deadline_expired): %s — %s", url, message)
+        self._save_state(
+            url, state_repo.STATE_SKIPPED_EXPIRED, input_hash,
+            reason_code=operational_eligibility.REASON_DEADLINE_EXPIRED, message=message,
+            details={
+                "resolved_deadline": facts["resolved_deadline"], "deadline_sources": facts["deadline_sources"],
+                "evaluated_at": facts["evaluated_at"],
+            },
+        )
+        return self._finish(
+            outcome, state_repo.STATE_SKIPPED_EXPIRED, operational_eligibility.REASON_DEADLINE_EXPIRED, message,
+        )
 
     # -- триаж ---------------------------------------------------------------
 
@@ -568,6 +603,8 @@ class AnalysisPipeline:
         input_hash = tender_context_module.compute_input_hash(ctx)
         progress["input_hash"] = input_hash
         prior = self.store.get_state(url)
+        eligibility = operational_eligibility.evaluate_context(ctx, self.clock())
+        outcome["operational_eligibility"] = eligibility.status
 
         # --- triage: reuse или новый вызов
         progress["stage"] = "triage"
@@ -580,6 +617,8 @@ class AnalysisPipeline:
             if _known_failure(prior, input_hash, self.triage_analyzer, (state_repo.STATE_TRIAGE_ERROR,)):
                 logger.info("Triage: известная неповторяемая ошибка для тех же входных данных, пропуск: %s", url)
                 return self._finish(outcome, prior["state"], prior["reason_code"], prior["message"], skipped_known_failure=True)
+            if self._expired_blocks_new_call(eligibility):
+                return self._skip_expired(url, input_hash, eligibility, outcome)
             triage_result, finished = self._run_triage(url, ctx, input_hash, outcome)
             if finished is not None:
                 return finished
@@ -615,6 +654,10 @@ class AnalysisPipeline:
                 escalation_reason=prior["escalation_reason"], skipped_known_failure=True,
             )
 
+        # --- Operational Eligibility: дальше только НОВАЯ работа (Gate -> Deep); reuse выше уже обработан
+        if self._expired_blocks_new_call(eligibility):
+            return self._skip_expired(url, input_hash, eligibility, outcome)
+
         # --- Commercial Gate (relevant и maybe; relevance_status не меняется)
         gate_result = self.gate(triage_result, ctx, self.settings.min_deep_value_amd)
         logger.info("Commercial Gate: %s -> %s (%s)", url, gate_result["gate_decision"], gate_result["gate_reason"])
@@ -638,13 +681,33 @@ class AnalysisPipeline:
 
     # -- batch ---------------------------------------------------------------
 
-    def pending_reason(self, url: str) -> str | None:
+    def assess(self, url: str) -> tuple:
         """
-        Почему тендер надо обрабатывать (needs_* новые, retry_* повтор) или None, если он «settled»:
-        для текущих (hash, prompt, model, настроек) результат/терминальное состояние уже есть.
-        Чтение only; API не вызывается.
+        (pending_reason, eligibility), только чтение. Если работа нужна, но срок надёжно истёк (и нет override),
+        причина = skip_expired: тендер не тратит AI и не занимает место в операторском limit. Если состояние
+        skipped_expired для текущих данных уже записано — settled (None), повторно не пишется.
         """
         ctx = tender_context_module.build_tender_context(url, db_path=self.db_path)
+        eligibility = operational_eligibility.evaluate_context(ctx, self.clock())
+        reason = self._pending_reason_for(url, ctx)
+        if reason in PAID_WORK_REASONS and self._expired_blocks_new_call(eligibility):
+            prior = self.store.get_state(url)
+            settled = (
+                prior is not None and prior["state"] == state_repo.STATE_SKIPPED_EXPIRED
+                and prior["input_hash"] == tender_context_module.compute_input_hash(ctx)
+            )
+            return (None if settled else REASON_SKIP_EXPIRED), eligibility
+        return reason, eligibility
+
+    def pending_reason(self, url: str) -> str | None:
+        """
+        Почему тендер надо обрабатывать (needs_* новые, retry_* повтор, skip_expired — только $0-учёт
+        истёкшего срока) или None, если он «settled»: для текущих (hash, prompt, model, настроек) результат /
+        терминальное состояние уже есть. Чтение only; API не вызывается.
+        """
+        return self.assess(url)[0]
+
+    def _pending_reason_for(self, url: str, ctx: dict) -> str | None:
         input_hash = tender_context_module.compute_input_hash(ctx)
         prior = self.store.get_state(url)
         same = prior is not None and prior["input_hash"] == input_hash
@@ -684,24 +747,31 @@ class AnalysisPipeline:
 
     def select_candidates(self, limit: int | None = None) -> list:
         """
-        [{resource_url, reason}]: только тендеры, требующие работы; новые раньше retry, внутри — по
-        first_seen_at. limit — оператор-лимит числа тендеров за запуск (не бизнес-лимит в день).
+        [{resource_url, reason, operational_status}]: только тендеры, требующие работы; новые раньше retry,
+        внутри — по first_seen_at. limit — оператор-лимит числа тендеров за запуск (не бизнес-лимит в день).
+        Кандидаты skip_expired ($0) в limit не входят и идут в конце: истёкшие не вытесняют активных.
         """
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
             raise ValueError(f"limit должен быть положительным целым или None: {limit!r}")
-        fresh, retry = [], []
+        fresh, retry, expired = [], [], []
         for url in self.store.enriched_urls():
             try:
-                reason = self.pending_reason(url)
+                reason, eligibility = self.assess(url)
+                status = eligibility.status
             except Exception:
                 logger.exception("Не удалось определить состояние тендера, считаю кандидатом: %s", url)
-                reason = "needs_triage"
+                reason, status = "needs_triage", operational_eligibility.STATUS_UNKNOWN
+            candidate = {"resource_url": url, "reason": reason, "operational_status": status}
             if reason in FRESH_REASONS:
-                fresh.append({"resource_url": url, "reason": reason})
+                fresh.append(candidate)
             elif reason in RETRY_REASONS:
-                retry.append({"resource_url": url, "reason": reason})
+                retry.append(candidate)
+            elif reason == REASON_SKIP_EXPIRED:
+                expired.append(candidate)
         candidates = fresh + retry
-        return candidates if limit is None else candidates[:limit]
+        if limit is not None:
+            candidates = candidates[:limit]
+        return candidates + expired
 
     def process_batch(self, limit: int | None = None) -> dict:
         """Ошибка одного тендера не прерывает остальные (process_announcement не бросает)."""
@@ -781,7 +851,30 @@ def _add_triage_preflight(total: dict, pre: dict) -> None:
     total["max_output_tokens_per_candidate"] = pre["estimated_output_tokens"]
 
 
-def dry_run(db_path=None, limit: int | None = None, environ=None) -> dict:
+def _operational_summary(pipeline: "AnalysisPipeline", store) -> dict:
+    """
+    Read-only срез по ВСЕМ объявлениям с enrichment (не зависит от limit): статусы срока и разбивка тех,
+    кому нужна работа, по статусу срока (needs_triage_active / skip_expired / deadline_unknown / ...).
+    """
+    status_counts, pending = {}, {}
+    for url in store.enriched_urls():
+        reason, eligibility = pipeline.assess(url)
+        status_counts[eligibility.status] = status_counts.get(eligibility.status, 0) + 1
+        if reason is None:
+            continue
+        if reason == REASON_SKIP_EXPIRED:
+            key = REASON_SKIP_EXPIRED
+        elif eligibility.status == operational_eligibility.STATUS_ELIGIBLE:
+            key = f"{reason}_active"
+        elif eligibility.status == operational_eligibility.STATUS_UNKNOWN:
+            key = f"{reason}_deadline_unknown"
+        else:
+            key = f"{reason}_deadline_conflict"
+        pending[key] = pending.get(key, 0) + 1
+    return {"status_counts": status_counts, "pending_by_status": pending}
+
+
+def dry_run(db_path=None, limit: int | None = None, environ=None, now=None) -> dict:
     """
     Отчёт без платных операций и без записи: analyzers создаются, но client — никогда (build_request
     client не требует); БД открывается через read-only store. Показывает кандидатов и маршрутизацию,
@@ -790,7 +883,8 @@ def dry_run(db_path=None, limit: int | None = None, environ=None) -> dict:
     settings = load_budget_settings(environ)
     triage, deep = build_analyzers(settings, environ)
     store = _ReadOnlyStore(db_path)
-    pipeline = AnalysisPipeline(triage, deep, settings, db_path=db_path, store=store)
+    clock = (lambda: now) if now is not None else operational_eligibility.utc_now
+    pipeline = AnalysisPipeline(triage, deep, settings, db_path=db_path, store=store, clock=clock)
 
     spend = store.month_spend()
     candidates = pipeline.select_candidates(limit)
@@ -805,6 +899,9 @@ def dry_run(db_path=None, limit: int | None = None, environ=None) -> dict:
     for candidate in candidates:
         url = candidate["resource_url"]
         reason_counts[candidate["reason"]] = reason_counts.get(candidate["reason"], 0) + 1
+        if candidate["reason"] == REASON_SKIP_EXPIRED:  # $0: ни preflight, ни Gate/Deep Admission
+            routing[REASON_SKIP_EXPIRED] = routing.get(REASON_SKIP_EXPIRED, 0) + 1
+            continue
         triage_row = store.get_triage(url)
         ctx = tender_context_module.build_tender_context(url, db_path=db_path)
         if candidate["reason"] in ("needs_triage", "retry_triage"):
@@ -830,7 +927,10 @@ def dry_run(db_path=None, limit: int | None = None, environ=None) -> dict:
                 key = f"deep:{admission['deep_analysis_status']}"
         routing[key] = routing.get(key, 0) + 1
 
+    operational = _operational_summary(pipeline, store)
     return {
+        "operational_eligibility": operational,
+        "evaluated_at": clock().isoformat(),
         "db_path": str(Path(db_path) if db_path is not None else DEFAULT_DB_PATH),
         "config": {
             "triage_model": settings.triage_model, "triage_reasoning_effort": settings.triage_reasoning_effort,
@@ -884,7 +984,15 @@ def _print_dry_run(report: dict) -> None:
     print()
     print(f"Расход за месяц (UTC): ${report['month_spend_usd']}, остаток: ${report['month_remaining_usd']}")
     print(f"Объявлений с enrichment: {report['enriched_total']}")
-    print(f"Кандидатов к обработке (limit={report['limit']}): {report['candidate_count']}")
+    print(f"Время оценки срока (aware): {report['evaluated_at']}")
+    operational = report["operational_eligibility"]
+    print("Operational Eligibility (все объявления с enrichment, независимо от limit):")
+    for name, count in sorted(operational["status_counts"].items()):
+        print(f"  {name}: {count}")
+    print("  требуют работы, по статусу срока:")
+    for name, count in sorted(operational["pending_by_status"].items()):
+        print(f"    {name}: {count}")
+    print(f"Кандидатов к обработке (limit={report['limit']}; skip_expired в limit не входят): {report['candidate_count']}")
     for name, count in sorted(report["candidate_reasons"].items()):
         print(f"  {name}: {count}")
     _print_triage_preflight(report["triage_preflight"], report["config"]["triage_model"])
@@ -908,11 +1016,15 @@ def main(argv=None) -> int:
     mode.add_argument("--dry-run", action="store_true", help="Отчёт без API и без записи")
     mode.add_argument("--run-one", metavar="RESOURCE_URL", help="Один явно выбранный тендер (preflight без confirm)")
     parser.add_argument("--confirm-paid-call", action="store_true", help="Только с --run-one: разрешить платные вызовы")
+    parser.add_argument("--allow-expired", action="store_true",
+                        help="Только с --run-one: обойти ТОЛЬКО deadline-гейт (BudgetGuard/учёт/Gate остаются)")
     parser.add_argument("--limit", type=int, default=None, help="Ограничить число тендеров (оператор)")
     parser.add_argument("--db-path", default=None, help="SQLite БД (для --run-one: иначе DATABASE_PATH из env/.env, иначе data/tenders.db)")
     args = parser.parse_args(argv)
     if args.confirm_paid_call and not args.run_one:
         parser.error("--confirm-paid-call допустим только с --run-one")
+    if args.allow_expired and not args.run_one:
+        parser.error("--allow-expired допустим только с --run-one")
     if args.run_one and args.limit is not None:
         parser.error("--limit несовместим с --run-one (всегда ровно один тендер)")
 
@@ -930,7 +1042,7 @@ def main(argv=None) -> int:
             return one_shot.EXIT_USAGE
         return one_shot.run_one(
             args.run_one, triage, deep, settings, db_path=resolve_db_path(args.db_path),
-            confirm=args.confirm_paid_call,
+            confirm=args.confirm_paid_call, allow_expired=args.allow_expired,
         )
     _print_dry_run(dry_run(db_path=args.db_path, limit=args.limit))
     return 0
