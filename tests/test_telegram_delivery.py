@@ -337,10 +337,10 @@ class MessageTests(unittest.TestCase):
                 "procurement": {**FULL_RESULT["procurement"],
                                 "items": [{"item_name": f"Товар {n}"} for n in range(30)]}}
         text = message.build_card(many, self.URL)
-        self.assertIn("... и ещё 23", text)  # items: 30 - 7
-        self.assertIn("... и ещё 7", text)  # missing: 12 - 5
-        self.assertIn("... и ещё 4", text)  # barriers: 9 - 5
-        self.assertNotIn("Товар 8", text)
+        self.assertIn("... и ещё 25", text)  # items: 30 - 5
+        self.assertIn("... и ещё 8", text)  # missing: 12 - 4
+        self.assertIn("... и ещё 6", text)  # barriers: 9 - 3
+        self.assertNotIn("Товар 5", text)
         self.assertLessEqual(len(text), message.TELEGRAM_MESSAGE_LIMIT)
 
     def test_worst_case_fits_telegram_limit(self):
@@ -350,6 +350,87 @@ class MessageTests(unittest.TestCase):
                 "procurement": {"subject": long, "items": [{"item_name": long}] * 50,
                                 "technical_requirements": [long] * 20}}
         self.assertLessEqual(len(message.build_card(many, self.URL)), message.TELEGRAM_MESSAGE_LIMIT)
+
+
+def _bullet_count(text: str, title: str) -> int:
+    section = next(p for p in text.split("\n\n") if p.startswith(f"<b>{title}"))
+    return sum(line.startswith("• ") for line in section.split("\n"))
+
+
+class CompactCardTests(unittest.TestCase):
+    URL = "https://example.test/r/1"
+
+    def card(self, **changes):
+        procurement = {**FULL_RESULT["procurement"], **changes.pop("procurement", {})}
+        return message.build_card({**FULL_RESULT, **changes, "procurement": procurement}, self.URL)
+
+    def test_category_human_label(self):
+        text = self.card(category="computer_equipment")
+        self.assertIn("<b>Категория:</b>\nКомпьютерное оборудование", text)
+        self.assertNotIn("computer_equipment", text)
+        for code in message.CATEGORY_RU:
+            self.assertNotIn("_", message.category_label(code))
+
+    def test_unknown_category_degrades_safely(self):
+        self.assertEqual(message.category_label("office_chairs"), "Office chairs")
+        self.assertEqual(message.category_label("IT оборудование"), "IT оборудование")
+        self.assertIsNone(message.category_label(None))
+
+    def test_placeholder_lots_do_not_create_what_is_procured(self):
+        for items in ([{"item_name": "Лот 1"}, {"item_name": "Лот 2"}], [{"item_name": "Lot 1"}]):
+            text = self.card(procurement={"items": items, "lots": [{"lot_number": "1"}, {"lot_number": "2"}]})
+            self.assertNotIn("Что закупают", text)
+            self.assertIn("Лотов: 2", text)
+
+    def test_lots_not_duplicated_when_summary_mentions_them(self):
+        text = self.card(procurement={"quantity_summary": "2 лота. Позиции не указаны.", "total_lots": 2})
+        self.assertNotIn("Лотов: 2", text)
+
+    def test_real_item_names_still_shown(self):
+        text = self.card(procurement={"items": [{"item_name": "Лот 1"}, {"item_name": "Ноутбук"}]})
+        self.assertIn("<b>Что закупают:</b>\n• Ноутбук", text)
+        self.assertNotIn("Лот 1", text)
+
+    def test_list_limits(self):
+        text = self.card(
+            missing_information=[f"Вопрос {n}" for n in range(9)],
+            participation_barriers=[{"description": f"Барьер {n}"} for n in range(9)],
+            procurement={"technical_requirements": [f"Требование {n}" for n in range(9)],
+                         "items": [{"item_name": f"Товар {n}"} for n in range(9)]})
+        self.assertEqual(_bullet_count(text, "Ключевые требования"), 3)
+        self.assertEqual(_bullet_count(text, "⚠️ Барьеры"), 3)
+        self.assertEqual(_bullet_count(text, "❓ Нужно уточнить"), 4)
+        self.assertEqual(_bullet_count(text, "Что закупают"), 5)
+        for expected in ("... и ещё 6", "... и ещё 5", "... и ещё 4"):
+            self.assertIn(expected, text)
+
+    def test_why_interesting_limited_and_optional(self):
+        why = "Первое. Второе! Третье? Четвёртое."
+        text = self.card(why_interesting=why)
+        self.assertEqual(_bullet_count(text, "Почему может быть интересно"), 2)
+        self.assertIn("• Второе!", text)
+        self.assertNotIn("Третье", text)
+        for empty in ("", None, "  "):
+            self.assertNotIn("Почему может быть интересно", self.card(why_interesting=empty))
+        self.assertNotIn("Почему может быть интересно", message.build_card({"summary": "x"}, None))
+
+    def test_truncation_never_cuts_words(self):
+        text = "Поставщик должен подтвердить наличие сертификата соответствия на всю партию товара"
+        for limit in range(15, len(text)):
+            clipped = message._clip(text, limit)
+            self.assertLessEqual(len(clipped), limit)
+            body = clipped.removesuffix("...")
+            self.assertTrue(body == text or text.startswith(body), clipped)
+            self.assertTrue(len(body) == len(text) or text[len(body)] == " ", clipped)
+        self.assertEqual(message._clip("Коротко", 50), "Коротко")  # не сокращён — без "..."
+        self.assertEqual(message._clip("Первое предложение. Второе предложение длинное", 35), "Первое предложение.")
+
+    def test_total_length_with_all_sections(self):
+        long = "Очень длинное требование к поставке " * 20
+        text = self.card(why_interesting=long, missing_information=[long] * 9,
+                         participation_barriers=[{"description": long}] * 9,
+                         procurement={"technical_requirements": [long] * 9, "items": [{"item_name": long}] * 9})
+        self.assertLessEqual(len(text), message.TELEGRAM_MESSAGE_LIMIT)
 
 
 class RealClientTests(unittest.TestCase):

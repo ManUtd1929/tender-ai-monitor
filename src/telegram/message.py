@@ -7,6 +7,7 @@ evidence в карточку не попадает, длинные списки 
 """
 
 import html
+import re
 
 TELEGRAM_MESSAGE_LIMIT = 4096
 LINK_TEXT = "Открыть тендер"
@@ -14,8 +15,33 @@ HEADER = "🟢 Новый подходящий тендер"
 NOT_SPECIFIED = "Не указано"
 
 # (max_items, max_chars_per_line): первый профиль, который укладывается в лимит Telegram, побеждает.
-SIZE_PROFILES = ((7, 160), (3, 100), (1, 60))
-MAX_BULLETS = 5  # барьеры / что уточнить / требования; items берут max_items профиля
+SIZE_PROFILES = ((5, 160), (3, 100), (1, 60))
+# Лимиты списков компактной карточки (профиль размера может только уменьшить их).
+MAX_ITEMS, MAX_REQUIREMENTS, MAX_BARRIERS, MAX_MISSING, MAX_WHY = 5, 3, 3, 4, 2
+
+# Отображаемые названия категорий; сохранённый category в БД не меняется.
+CATEGORY_RU = {
+    "aviation_fuel": "Авиационное топливо",
+    "blinds": "Жалюзи",
+    "computer_equipment": "Компьютерное оборудование",
+    "drinking_water": "Питьевая вода",
+    "household_goods": "Хозяйственные товары",
+    "infrastructure_goods": "Инфраструктурные товары",
+    "laboratory_supplies": "Лабораторные материалы",
+    "medical_equipment": "Медицинское оборудование",
+    "modular_buildings": "Модульные здания",
+    "pharmaceuticals_and_lab_supplies": "Фармацевтика и лабораторные материалы",
+    "plants": "Растения / озеленение",
+    "tires": "Шины",
+    "archiving_services": "Услуги архивирования",
+    "design_and_cost_estimation": "Проектирование и сметы",
+    "expertise_services": "Экспертные услуги",
+    "software_license": "Лицензии на ПО",
+    "sports_event_services": "Организация спортивных мероприятий",
+    "technical_supervision": "Технический надзор",
+}
+_LOT_PLACEHOLDER = re.compile(r"^(лот|lot|լոտ)\s*(№|#|n)?\s*\d+$", re.IGNORECASE)
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
 CONFIDENCE_RU = {"high": "высокая", "medium": "средняя", "low": "низкая"}
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
@@ -31,7 +57,30 @@ def _clean(value) -> str | None:
 
 
 def _clip(text: str, max_chars: int) -> str:
-    return text if len(text) <= max_chars else text[: max_chars - 1].rstrip() + "…"
+    """Сокращает по границе предложения, иначе слова; слово посередине не режется."""
+    if len(text) <= max_chars:
+        return text
+    head = text[: max_chars - 3]
+    if text[len(head)] != " ":  # граница обрезки внутри слова — откатываемся к пробелу
+        head = head.rsplit(" ", 1)[0] if " " in head else head
+    ends = [m.start() for m in re.finditer(r"[.!?](?=\s|$)", head)]
+    if ends and ends[-1] + 1 >= max_chars * 0.4:
+        return head[: ends[-1] + 1]
+    return head.rstrip(" ,;:-–—") + "..."
+
+
+def category_label(category) -> str | None:
+    code = _clean(category)
+    if not code:
+        return None
+    if code in CATEGORY_RU:
+        return CATEGORY_RU[code]
+    text = code.replace("_", " ")
+    return text[0].upper() + text[1:]
+
+
+def _is_placeholder(name: str) -> bool:
+    return bool(_LOT_PLACEHOLDER.match(name.strip()))
 
 
 def _esc(text: str) -> str:
@@ -52,7 +101,7 @@ def _section(title: str, lines: list[str]) -> str | None:
 
 def _item_line(item: dict) -> str | None:
     name = _clean(item.get("item_name"))
-    if not name:
+    if not name or _is_placeholder(name):
         return None
     quantity = " ".join(p for p in (_clean(item.get("quantity")), _clean(item.get("unit"))) if p)
     return f"{name} — {quantity}" if quantity else name
@@ -60,9 +109,9 @@ def _item_line(item: dict) -> str | None:
 
 def _lot_line(lot: dict) -> str | None:
     number, description = _clean(lot.get("lot_number")), _clean(lot.get("description"))
-    if not (number or description):
+    if not description:  # «Лот N» без описания — не информация о предмете (число лотов — в «Количество / лоты»)
         return None
-    return f"Лот {number}: {description}" if number and description else (f"Лот {number}" if number else description)
+    return f"Лот {number}: {description}" if number else description
 
 
 def _what_is_procured(procurement: dict, logistics: dict) -> list[str]:
@@ -85,9 +134,15 @@ def _quantity_lines(procurement: dict) -> list[str]:
     if summary := _clean(procurement.get("quantity_summary")):
         lines.append(summary)
     total_lots = procurement.get("total_lots")
-    if isinstance(total_lots, int) and not isinstance(total_lots, bool):
+    mentions_lots = "лот" in " ".join(lines).lower()  # summary уже говорит про лоты — не дублируем
+    if isinstance(total_lots, int) and not isinstance(total_lots, bool) and not mentions_lots:
         lines.append(f"Лотов: {total_lots}")
     return lines
+
+
+def _why_lines(value) -> list[str]:
+    text = _clean(value)
+    return [p for p in _SENTENCE_END.split(text) if p][:MAX_WHY] if text else []
 
 
 def _barrier_texts(barriers) -> list[str]:
@@ -121,16 +176,17 @@ def _build(result: dict, resource_url, deadline, value_amd, max_items: int, max_
         one("Предмет:", subject),
         one("Заказчик:", result.get("contracting_authority") or NOT_SPECIFIED),
         one("Процедура:", result.get("procedure_code")),
-        one("Категория:", result.get("category")),
+        one("Категория:", category_label(result.get("category"))),
         one("Дедлайн:", deadline),
-        _section("Что закупают:", _bullets(_what_is_procured(procurement, logistics), max_items, max_chars)),
+        _section("Что закупают:", _bullets(_what_is_procured(procurement, logistics), min(MAX_ITEMS, max_items), max_chars)),
         _section("Количество / лоты:", [_esc(_clip(t, max_chars)) for t in _quantity_lines(procurement)]),
         one("Оценочная стоимость:", format_value_amd(value_amd)),
-        _section("Ключевые требования:", _bullets(requirements, min(MAX_BULLETS, max_items), max_chars)),
+        _section("Почему может быть интересно:", _bullets(_why_lines(result.get("why_interesting")), MAX_WHY, max_chars)),
+        _section("Ключевые требования:", _bullets(requirements, min(MAX_REQUIREMENTS, max_items), max_chars)),
         _section("⚠️ Барьеры участия:", _bullets(_barrier_texts(result.get("participation_barriers")),
-                                                  min(MAX_BULLETS, max_items), max_chars)),
+                                                  min(MAX_BARRIERS, max_items), max_chars)),
         _section("❓ Нужно уточнить:", _bullets(result.get("missing_information") or [],
-                                                min(MAX_BULLETS, max_items), max_chars)),
+                                                min(MAX_MISSING, max_items + 1), max_chars)),
         one("Уверенность анализа:", CONFIDENCE_RU.get(result.get("confidence"), result.get("confidence"))),
     ]
     url = _clean(resource_url)
