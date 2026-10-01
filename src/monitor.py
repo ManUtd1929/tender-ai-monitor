@@ -129,6 +129,20 @@ def _run_ai_analysis_if_enabled() -> dict | None:
         return {"status": "error", "error_type": type(error).__name__, "error_message": str(error)}
 
 
+def _run_telegram_if_enabled() -> dict | None:
+    """
+    Telegram-доставка готовых deep results после AI-стадии (только чтение SQLite, без AI). Выключена
+    (None) пока TELEGRAM_NOTIFICATIONS_ENABLED не true. Ошибка стадии не прерывает мониторинг.
+    """
+    from src.telegram import delivery
+
+    try:
+        return delivery.run_delivery_from_env()
+    except Exception as error:
+        logger.error("Telegram-доставка завершилась ошибкой (%s); мониторинг продолжается", type(error).__name__)
+        return {"status": "error", "error_type": type(error).__name__}
+
+
 def run_monitor(page: int = 1) -> dict:
     """
     Один проход мониторинга: получить объявления всех разделов, сохранить в базу,
@@ -213,6 +227,7 @@ def run_monitor(page: int = 1) -> dict:
     pending_documents_after = document_repository.count_document_processing_candidates()
 
     ai_analysis_result = _run_ai_analysis_if_enabled()
+    telegram_result = _run_telegram_if_enabled()
 
     return {
         "fetched_count": fetched_count,
@@ -236,6 +251,7 @@ def run_monitor(page: int = 1) -> dict:
         "document_result": document_result,
         "pending_documents_after": pending_documents_after,
         "ai_analysis": ai_analysis_result,
+        "telegram_delivery": telegram_result,
     }
 
 
@@ -361,6 +377,11 @@ def main():
     if ai_result is not None:
         print()
         print(f"AI-анализ: {ai_result}")
+
+    telegram_result = result["telegram_delivery"]
+    if telegram_result is not None:
+        print()
+        print(f"Telegram: {telegram_result}")
 
 
 if __name__ == "__main__":
