@@ -34,6 +34,7 @@ OpenAI client здесь не создаётся: analyzers инъектирую
 
 CLI:
     python -m src.ai.analysis_pipeline --dry-run [--limit N]
+    python -m src.ai.analysis_pipeline --run-one "<URL>" [--confirm-paid-call]   (см. src.ai.one_shot)
 """
 
 import argparse
@@ -900,16 +901,34 @@ def main(argv=None) -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except AttributeError:
         pass
-    parser = argparse.ArgumentParser(description="AI analysis pipeline (live-режима в CLI нет)")
-    parser.add_argument("--dry-run", action="store_true", required=True, help="Отчёт без API и без записи")
+    parser = argparse.ArgumentParser(description="AI analysis pipeline (batch live-режима в CLI нет)")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true", help="Отчёт без API и без записи")
+    mode.add_argument("--run-one", metavar="RESOURCE_URL", help="Один явно выбранный тендер (preflight без confirm)")
+    parser.add_argument("--confirm-paid-call", action="store_true", help="Только с --run-one: разрешить платные вызовы")
     parser.add_argument("--limit", type=int, default=None, help="Ограничить число тендеров (оператор)")
     parser.add_argument("--db-path", default=None, help="SQLite БД (по умолчанию data/tenders.db)")
     args = parser.parse_args(argv)
+    if args.confirm_paid_call and not args.run_one:
+        parser.error("--confirm-paid-call допустим только с --run-one")
+    if args.run_one and args.limit is not None:
+        parser.error("--limit несовместим с --run-one (всегда ровно один тендер)")
 
     from dotenv import load_dotenv
 
     load_dotenv(PROJECT_ROOT / ".env")  # не перезаписывает уже заданные переменные окружения
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+    if args.run_one:
+        from src.ai import one_shot
+
+        settings = load_budget_settings()
+        triage, deep = build_analyzers(settings)
+        if args.confirm_paid_call and not (triage.has_api_key and deep.has_api_key):
+            print("ERROR: OPENAI_API_KEY не задан, вызовов нет")
+            return one_shot.EXIT_USAGE
+        return one_shot.run_one(
+            args.run_one, triage, deep, settings, db_path=args.db_path, confirm=args.confirm_paid_call,
+        )
     _print_dry_run(dry_run(db_path=args.db_path, limit=args.limit))
     return 0
 

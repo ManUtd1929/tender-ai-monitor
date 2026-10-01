@@ -242,6 +242,23 @@ class CommercialGateTests(unittest.TestCase):
         self.assertEqual(result["gate_decision"], gate.DEEP_CANDIDATE)
         self.assertEqual(result["confidence"], gate.CONFIDENCE_LOW)
 
+    def test_unknown_value_with_documents_is_not_skipped_when_threshold_is_none(self):
+        # MIN_DEEP_VALUE_AMD не задан: отсутствие стоимости само по себе не даёт skip
+        result = self.evaluate(context([doc(1, "a.docx", "Поставка товаров, технические требования")]), None)
+        self.assertIsNone(result["estimated_value_amd"])
+        self.assertEqual(result["gate_decision"], gate.DEEP_CANDIDATE)
+        self.assertEqual(result["confidence"], gate.CONFIDENCE_LOW)
+
+    def test_unknown_value_with_quantity_only_is_not_skipped_when_threshold_is_none(self):
+        # количество в спецификации без цены: ни skip, ни «too small»
+        ctx = context([doc(1, "spec.xlsx", XLSX_TEXT, file_type="xlsx")])
+        result = self.evaluate(ctx, None)
+        self.assertEqual(result["gate_decision"], gate.DEEP_CANDIDATE)
+
+    def test_unknown_value_without_documents_is_insufficient_when_threshold_is_none(self):
+        result = self.evaluate(context([]), None)
+        self.assertEqual(result["gate_decision"], gate.INSUFFICIENT_INFORMATION)
+
     def test_unknown_value_without_any_extracted_document_is_insufficient_information(self):
         result = self.evaluate(context([]), self.MIN)
         self.assertEqual(result["gate_decision"], gate.INSUFFICIENT_INFORMATION)
