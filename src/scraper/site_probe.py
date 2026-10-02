@@ -8,11 +8,9 @@
 
 import os
 import sys
-import warnings
 
 import requests
 import truststore
-from urllib3.exceptions import InsecureRequestWarning
 
 URL = "https://gnumner.minfin.am/ru/page/obyavleniya_o_zakupkakh_/"
 TIMEOUT = 15
@@ -67,11 +65,7 @@ def probe_site():
         if _probe_with_truststore():
             return
 
-        print(
-            "truststore тоже не помог. Запускаю диагностический запрос "
-            "с verify=False только для сравнения результатов."
-        )
-        _probe_with_verify_disabled()
+        print("truststore тоже не помог. Соединение не установлено (verify остаётся включённым).")
         return
     except requests.exceptions.RequestException as e:
         print(f"Ошибка запроса: {e}")
@@ -96,8 +90,7 @@ def _probe_with_truststore() -> bool:
 
     truststore.extract_from_ssl() возвращает ssl.SSLContext к
     состоянию по умолчанию (certifi), чтобы подмена не влияла на
-    остальной код скрипта (в частности, на диагностический fallback
-    с verify=False).
+    остальной код скрипта.
     """
     truststore.inject_into_ssl()
     response = None
@@ -120,31 +113,6 @@ def _probe_with_truststore() -> bool:
     print(f"Encoding: {response.encoding}")
     print(f"Размер HTML: {len(response.text)} символов")
     return True
-
-
-def _probe_with_verify_disabled():
-    """
-    ВРЕМЕННЫЙ диагностический обход.
-
-    verify=False используется здесь ТОЛЬКО чтобы проверить, доступен ли сайт
-    вообще, если основной запрос с verify=True упал из-за SSL-ошибки.
-    Это НЕ безопасное production-решение: проверка сертификата сервера
-    полностью отключена, что открывает риск MITM. Перед реализацией
-    настоящего scraper'а нужно заменить этот обход нормальным решением
-    (например, пакетом truststore, использующим системное хранилище
-    сертификатов Windows, или дополненным CA bundle с недостающим
-    промежуточным сертификатом).
-    """
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", InsecureRequestWarning)
-        try:
-            response = requests.get(URL, headers=HEADERS, timeout=TIMEOUT, verify=False)
-        except requests.exceptions.RequestException as e:
-            print(f"Диагностический запрос (verify=False) тоже завершился ошибкой: {e}")
-            return
-
-    print_diagnostics(response)
-    save_if_ok(response)
 
 
 if __name__ == "__main__":

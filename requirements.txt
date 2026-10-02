@@ -6,3 +6,4 @@ openpyxl
 openai
 python-dotenv
 tzdata
+certifi

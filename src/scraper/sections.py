@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from src import http_tls
 from src.scraper.gnumner import HEADERS, TIMEOUT, configure_tls
 from src.scraper.tender_list_parser import parse_tenders
 
@@ -95,7 +96,7 @@ def build_section_page_url(section_key: str, page: int = 1) -> str:
 def fetch_section_page(section_key: str, page: int = 1) -> str:
     url = build_section_page_url(section_key, page)
 
-    response = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=True)
+    response = http_tls.get(url, headers=HEADERS, timeout=TIMEOUT, verify=True)
     response.raise_for_status()
 
     logger.info(

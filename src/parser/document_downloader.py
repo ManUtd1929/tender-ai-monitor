@@ -42,6 +42,7 @@ from urllib.parse import quote, unquote, urlparse
 
 import requests
 
+from src import http_tls
 from src.scraper.gnumner import HEADERS, TIMEOUT
 
 logger = logging.getLogger(__name__)
@@ -327,7 +328,7 @@ def download_direct_file(
 
     own_session = session is None
     if own_session:
-        session = requests.Session()
+        session = http_tls.new_session()
     try:
         response = _get(session, url)
         return _save_response(

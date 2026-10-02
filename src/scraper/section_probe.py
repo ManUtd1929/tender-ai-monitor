@@ -19,6 +19,7 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup, Tag
 
+from src import http_tls
 from src.scraper.gnumner import HEADERS, TIMEOUT, configure_tls
 from src.scraper.tender_list_parser import (
     PUBLISHED_AT_PATTERN,
@@ -190,7 +191,7 @@ def find_extra_data(tender_divs: list[Tag], ref: dict) -> dict:
 
 
 def analyze_section(name: str, url: str, ref: dict) -> dict:
-    response = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=True)
+    response = http_tls.get(url, headers=HEADERS, timeout=TIMEOUT, verify=True)
     response.raise_for_status()
     html = response.text
 

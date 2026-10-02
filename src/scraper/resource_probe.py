@@ -29,6 +29,7 @@ from urllib.parse import unquote, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
+from src import http_tls
 from src.scraper.gnumner import HEADERS, TIMEOUT, configure_tls
 
 TARGETS = [
@@ -118,7 +119,7 @@ def read_capped(response) -> tuple[bytes, bool]:
 
 def fetch(url: str) -> tuple[dict, bytes | None]:
     """Один GET. Тело читается только для HTML, иначе соединение просто закрывается."""
-    response = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=True, stream=True)
+    response = http_tls.get(url, headers=HEADERS, timeout=TIMEOUT, verify=True, stream=True)
     try:
         meta = {
             "final_url": response.url,

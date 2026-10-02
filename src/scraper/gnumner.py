@@ -11,6 +11,7 @@ import sys
 import requests
 import truststore
 
+from src import http_tls
 from src.scraper.tender_list_parser import parse_tenders
 
 BASE_URL = "https://gnumner.minfin.am/ru/page/obyavleniya_o_zakupkakh_/"
@@ -44,7 +45,7 @@ def fetch_page(page: int = 1) -> str:
 
     url = BASE_URL if page == 1 else f"{BASE_URL}{page}"
 
-    response = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=True)
+    response = http_tls.get(url, headers=HEADERS, timeout=TIMEOUT, verify=True)
     response.raise_for_status()
     return response.text
 
