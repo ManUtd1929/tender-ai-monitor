@@ -92,6 +92,14 @@ def get_delivery(resource_url: str, analysis_input_hash: str, db_path=None) -> d
     return dict(row) if row else None
 
 
+def get_delivery_by_id(delivery_id: int, db_path=None) -> dict | None:
+    """Строка доставки по telegram_deliveries.id (используется callback worker'ом)."""
+    with _connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM telegram_deliveries WHERE id = ?", (delivery_id,)).fetchone()
+    return dict(row) if row else None
+
+
 def begin_attempt(resource_url: str, analysis_input_hash: str, db_path=None) -> bool:
     """pending + attempt_count+1. False, если версия уже sent (повторная отправка запрещена)."""
     now = _utc_now()

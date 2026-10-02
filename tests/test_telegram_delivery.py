@@ -32,10 +32,12 @@ TOKEN = "123456:SECRET-TOKEN-VALUE"
 class FakeTelegramClient:
     def __init__(self, results=None):
         self.texts = []
+        self.markups = []
         self.results = list(results or [])
 
-    def send_message(self, text):
+    def send_message(self, text, reply_markup=None):
         self.texts.append(text)
+        self.markups.append(reply_markup)
         return self.results.pop(0) if self.results else SendResult(True, message_id=1000 + len(self.texts))
 
 

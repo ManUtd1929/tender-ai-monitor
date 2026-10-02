@@ -93,7 +93,9 @@ def _deliver_one(client, url: str, state_hash: str, db_path, clock, summary: dic
     summary["eligible_for_delivery"] += 1
     text = message.build_card(result, url, _format_deadline(eligibility), _official_value(context))
     repo.begin_attempt(url, input_hash, db_path=db_path)
-    send = client.send_message(text)  # одна попытка на версию за запуск
+    delivery_id = repo.get_delivery(url, input_hash, db_path=db_path)["id"]
+    markup = message.build_reply_markup(delivery_id, url)  # callback_data = full:<delivery id>
+    send = client.send_message(text, reply_markup=markup)  # одна попытка на версию за запуск
     if send.ok:
         repo.mark_sent(url, input_hash, send.message_id, db_path=db_path)
         summary["sent"] += 1

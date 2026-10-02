@@ -238,3 +238,29 @@ def build_card(result: dict, resource_url: str | None, deadline: str | None = No
         if len(text) <= TELEGRAM_MESSAGE_LIMIT:
             break
     return text
+
+
+FULL_BUTTON_TEXT = "📋 Полный анализ"
+OPEN_BUTTON_TEXT = "🔗 Открыть тендер"
+FULL_CALLBACK_PREFIX = "full:"
+_FULL_CALLBACK = re.compile(r"^full:(\d{1,18})$")
+
+
+def full_callback_data(delivery_id: int) -> str:
+    """full:<telegram_deliveries.id> — короткий opaque id (лимит Telegram 64 байта), без URL и JSON."""
+    return f"{FULL_CALLBACK_PREFIX}{delivery_id}"
+
+
+def parse_full_callback(data) -> int | None:
+    """delivery id из "full:<id>"; None для любого другого/некорректного значения."""
+    match = _FULL_CALLBACK.match(data) if isinstance(data, str) else None
+    return int(match.group(1)) if match else None
+
+
+def build_reply_markup(delivery_id: int, resource_url: str | None) -> dict:
+    """InlineKeyboardMarkup короткой карточки: callback «Полный анализ» + (если есть http-URL) «Открыть тендер»."""
+    row = [{"text": FULL_BUTTON_TEXT, "callback_data": full_callback_data(delivery_id)}]
+    url = _clean(resource_url)
+    if url and url.lower().startswith(("http://", "https://")):
+        row.append({"text": OPEN_BUTTON_TEXT, "url": url})
+    return {"inline_keyboard": [row]}
